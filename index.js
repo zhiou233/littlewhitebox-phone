@@ -4,7 +4,10 @@
 //   柚月小手机里的 AI 请求（微信 / 朋友圈 / 微博 / X / 日记…）是手机自己拼提示词，不走酒馆的生成流程，
 //   所以读不到小白X(LittleWhiteBox)注入的记忆。本插件读取小白X写入的
 //   extension_prompts["LittleWhiteBox_StorySummary"]，并包装手机的 ApiManager.callAI，
-//   在每次手机 AI 请求里多插入一条 system 消息（位置：手机的「[Start a new chat]」分界线之前）。
+//   在每次手机 AI 请求里多插入一条 system 消息（位置：手机带进来的主线正文聊天记录的末尾，紧挨在正文后面）。
+//
+// 功能一·附：给手机请求打缓存点
+//   在稳定内容的结尾加 gproxy 魔法字符串（和 st-compress-cache 同一句），让 Claude 缓存手机请求的前缀。
 //
 // 功能二：通话智能滚动
 //   手机在语音 / 视频 / 电话通话里，每出一条 AI 气泡都会执行 scrollTop = scrollHeight 强制拉到底。
@@ -50,8 +53,14 @@ export const DEFAULTS = Object.freeze({
     apps: Object.freeze(Object.fromEntries(APPS.map(([id]) => [id, true]))),
     smartScroll: true,
     alwaysScrollOnSend: true,
+    cacheEnabled: true,      // 手机请求自动打缓存点（需要 gproxy 渠道打开 Magic-string cache）
+    cacheTtl: '5m',          // 缓存时长：5m / 1h
     timeEnabled: true,       // 微信连发消息：放慢时间推进
     speedPercent: 100,       // 整体快慢：100 = 默认，50 = 快一倍，200 = 慢一倍
+    sumEnabled: true,        // 微信聊天自动摘要
+    sumTrigger: 300,         // 可见聊天攒到多少条就触发压缩
+    sumTake: 200,            // 每次压缩最老的多少条（剩下的原文保留）
+    sumMaxChars: 1500,       // 摘要大致上限（字）
     log: false,
 });
 
@@ -63,13 +72,31 @@ export function isDivider(m) {
     return text === DIVIDER_TEXT || String(m.name || '').includes('分界线');
 }
 
-// 记忆消息应该插在 messages 的哪个位置
-export function findInsertIndex(messages) {
+// 从 start 开始，连续的「非 system」消息（= 手机带进来的主线正文聊天）结束的位置。
+// 如果一路连到了最后一条（最后一条是本次请求的提问），要留出最后一条，记忆不能排到提问后面。
+function endOfStoryRun(messages, start) {
+    const n = messages.length;
+    let end = start;
+    while (end < n && messages[end] && messages[end].role !== 'system') end++;
+    if (end >= n) end = Math.max(start, n - 1);
+    return end;
+}
+
+// 记忆消息应该插在 messages 的哪个位置：主线正文聊天记录的「后面」（紧挨着正文结尾）
+//   微信：  ……设定 → 分界线 → 正文聊天 → [记忆] → 其余
+//   电话/短信：……设定 → 正文聊天 → [记忆] → 分界线 → 其余
+//   微博等没有分界线的：……设定 → 正文聊天 → [记忆] → 其余
+//   appId 用来判断正文在分界线的哪一边：微信（wechat）的正文在分界线后面，电话/短信等的正文在分界线前面
+export function findInsertIndex(messages, appId) {
     if (!Array.isArray(messages) || messages.length === 0) return 0;
     const divider = messages.findIndex(isDivider);
-    if (divider >= 0) return divider;
+    if (divider >= 0) {
+        if (appId && appId !== 'wechat') return divider;
+        const end = endOfStoryRun(messages, divider + 1);
+        return end > divider + 1 ? end : divider; // 分界线后面没有正文（正文在分界线前面）时，放在分界线前
+    }
     const firstNonSystem = messages.findIndex(m => m && m.role !== 'system');
-    if (firstNonSystem >= 0) return firstNonSystem;
+    if (firstNonSystem >= 0) return endOfStoryRun(messages, firstNonSystem);
     return messages.length - 1; // 全是 system：保持最后一条仍在最后
 }
 
@@ -97,13 +124,67 @@ export function injectMemory(messages, memory, opts = {}) {
     const probe = String(memory).trim().slice(0, 60);
     if (probe && messages.some(m => m && contentToText(m.content).includes(probe))) return messages;
     const out = messages.slice();
-    out.splice(findInsertIndex(messages), 0, {
+    out.splice(findInsertIndex(messages, opts.appId), 0, {
         role: 'system',
         content,
         name: 'SYSTEM (小白X记忆)',
         isPhoneMessage: true,
         [MARK]: true,
     });
+    return out;
+}
+
+/* ================================================================== 功能一·附：给手机请求打缓存点（gproxy 魔法字符串） */
+// 做法和 st-compress-cache 一样：在要缓存的那条消息末尾加一句 gproxy 认识的魔法字符串，
+// gproxy（渠道里打开 Magic-string cache）会把它删掉，并在那里打上 Claude 的 cache_control。
+// 手机的请求不经过酒馆的发送流程，所以 st-compress-cache 管不到，这里自己加。
+export const MAGIC = Object.freeze({
+    '5m': 'GPROXY_MAGIC_STRING_TRIGGER_CACHING_CREATE_49VA1S5V19GR4G89W2V695G9W9GV52W95V198WV5W2FC9DF',
+    '1h': 'GPROXY_MAGIC_STRING_TRIGGER_CACHING_CREATE_1FAS5GV9R5H29T5Y2J9584K6O95M2NBVW52C95CX984FRJY',
+});
+const MAGIC_PREFIX = 'GPROXY_MAGIC_STRING_TRIGGER_CACHING_CREATE_';
+// 每次请求都会变的内容（排在它们前面的才算「稳定」）。名字是手机给消息起的。
+const VOLATILE_NAMES = ['微信记录', '一起听歌', '通话 App 记录', '短信 App 记录', '朋友圈记录', '群成员朋友圈记录', '微信单聊记录', '通话 App 历史记录'];
+
+function isVolatile(m) {
+    const name = String(m?.name || '');
+    return VOLATILE_NAMES.some(k => name.includes(k));
+}
+
+function withMarker(m, marker) {
+    if (typeof m.content === 'string') return { ...m, content: m.content + '\n' + marker };
+    if (Array.isArray(m.content)) return { ...m, content: [...m.content, { type: 'text', text: marker }] };
+    return m;
+}
+
+// 返回新数组。打两个点（最多），都落在「稳定的内容」的结尾：
+//   点1：正文 + 小白X记忆 的结尾（设定、世界书、正文、记忆，换聊天对象也基本不变）
+//   点2：第一条「每次都变的内容」（微信记录、朋友圈、通话记录等）的前一条
+// 最后一条（本次提问）和每次都变的内容永远不打点。
+export function addCacheBreakpoints(messages, ttl = '5m', appId) {
+    if (!Array.isArray(messages) || messages.length < 2) return messages;
+    const marker = MAGIC[ttl] || MAGIC['5m'];
+    if (messages.some(m => m && contentToText(m.content).includes(MAGIC_PREFIX))) return messages; // 已经有了
+    const last = messages.length - 1;
+
+    // 点1
+    let bp1 = messages.findIndex(m => m && m[MARK]);
+    if (bp1 < 0) {
+        const cand = findInsertIndex(messages, appId) - 1;
+        if (cand >= 0 && messages[cand] && messages[cand].role !== 'system') bp1 = cand;
+    }
+    // 点2
+    let bp2 = -1;
+    const firstVolatile = messages.findIndex(isVolatile);
+    if (firstVolatile > 0) {
+        bp2 = firstVolatile - 1;
+        while (bp2 >= 0 && isDivider(messages[bp2])) bp2--; // 分界线的文字不能动
+    }
+
+    const targets = [...new Set([bp1, bp2])].filter(i => i >= 0 && i < last && !isVolatile(messages[i]) && !isDivider(messages[i]));
+    if (!targets.length) return messages;
+    const out = messages.slice();
+    for (const i of targets) out[i] = withMarker(out[i], marker);
     return out;
 }
 
@@ -239,6 +320,437 @@ function startChatViewPatching() {
     // 微信 App 是懒加载的；等它出现
     const timer = setInterval(() => { if (tryPatchChatView()) clearInterval(timer); }, 2000);
 }
+/* ================================================================== 功能三：微信聊天自动摘要 */
+// 微信聊天记录（含语音/视频通话）攒到「触发条数」后，把最老的一部分交给 AI 压缩成摘要，
+// 这些旧消息只是打上手机自己的 hiddenFromPrompt 标记（手机里仍然看得到，AI 不再收到原文），
+// 同时在发给 AI 的聊天记录最前面补上摘要。线上手机请求和酒馆正文都会带摘要。
+// 摘要和「已被压缩的消息」都存在当前酒馆聊天里（手机存储里 chat_ 开头的键）。
+
+const SUM_KEY = 'chat_yp_plus_summary';
+const SUM_HEAD = '【更早的聊天摘要】';
+const SUM_RETRY_MS = 5 * 60 * 1000;
+
+const sumInt = (v, d) => { const n = parseInt(v, 10); return Number.isFinite(n) ? n : d; };
+const sumClamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
+
+export function sumParams(s = {}) {
+    const trigger = sumClamp(sumInt(s.sumTrigger, 300), 40, 9999);
+    const take = sumClamp(sumInt(s.sumTake, 200), 10, trigger - 10);
+    return { trigger, take, keepLines: trigger - take, maxChars: sumClamp(sumInt(s.sumMaxChars, 1500), 300, 8000) };
+}
+
+// 手机发给 AI 时会跳过的消息（时间标记、已隐藏的）
+export function isCountable(m) {
+    return !!m && !(m.hiddenFromPrompt === true || m.isTimeMarker === true || m.type === 'time_marker');
+}
+
+// 和手机自己算「条数」的规则一致：接通的通话 = 通话里说的句数 + 2，其余 = 1
+export function msgLines(m) {
+    if (m?.type === 'call_record') {
+        const n = Array.isArray(m.transcript) ? m.transcript.length : 0;
+        return m.status === 'answered' ? n + 2 : 1;
+    }
+    return 1;
+}
+
+export function visibleLines(messages) {
+    let t = 0;
+    for (const m of messages || []) if (isCountable(m)) t += msgLines(m);
+    return t;
+}
+
+// 返回 { cut, lines, count }：messages 里下标 < cut 的「可见消息」要被压缩；没到触发条数返回 null
+//   keepLines：最少留下最近多少条；minKeepMessages：最少留下多少条消息（让正文注入不会和摘要重复）
+//   maxLines：这一次最多压多少条（积压很多时分批压）
+export function planCompression(messages, { trigger, keepLines, minKeepMessages = 0, maxLines = Infinity, force = false }) {
+    if (!Array.isArray(messages)) return null;
+    const total = visibleLines(messages);
+    if (!force && !(total >= trigger)) return null;
+    let acc = 0, cut = 0, enough = false;
+    for (let i = messages.length - 1; i >= 0; i--) {
+        if (!isCountable(messages[i])) continue;
+        acc += msgLines(messages[i]);
+        cut = i;
+        if (acc >= keepLines && messages.length - i >= minKeepMessages) { enough = true; break; }
+    }
+    if (!enough) return null; // 总共都不够留的
+    let lines = 0, count = 0;
+    for (let i = 0; i < cut; i++) {
+        if (!isCountable(messages[i])) continue;
+        lines += msgLines(messages[i]);
+        count++;
+        if (lines >= maxLines) { cut = i + 1; break; }
+    }
+    if (count === 0 || lines < 10) return null;
+    return { cut, lines, count };
+}
+
+const oneLine = (t, n = 500) => String(t ?? '').replace(/<img[^>]*>/gi, '[图片]').replace(/\s*\n\s*/g, ' ').trim().slice(0, n);
+
+function describeMessage(m) {
+    const type = m.type || 'text';
+    const content = String(m.content ?? '');
+    if (type === 'text') return /^(data:image|https?:\/\/\S+\.(png|jpe?g|gif|webp)(\?\S*)?$)/i.test(content.trim()) ? '[图片]' : oneLine(content);
+    if (type === 'image') {
+        const d = String(m.customEmojiDescription || m.customEmojiName || '').trim();
+        return d ? `[表情包]（${d}）` : '[图片]';
+    }
+    if (type === 'transfer') return `[转账 ¥${m.amount ?? ''}]`;
+    if (type === 'redpacket') return `[红包 ¥${m.amount ?? ''}]`;
+    if (type === 'system') return oneLine(content);
+    const text = /^data:/i.test(content.trim()) ? '' : oneLine(content, 200);
+    return text ? `[${type}] ${text}` : `[${type}]`;
+}
+
+function describeCall(m, userName, chatName, t) {
+    const kind = m.callType === 'video' ? '视频通话' : '语音通话';
+    if (m.status !== 'answered') {
+        const st = (m.status === 'rejected' || m.status === 'declined') ? '对方已拒绝' : m.status === 'cancelled' ? '已取消' : '未接听';
+        return `${t}[${kind} - ${st}]\n`;
+    }
+    const lines = [`${t}[${kind}开始]`];
+    for (const e of Array.isArray(m.transcript) ? m.transcript : []) {
+        const text = oneLine(e?.text, 300);
+        if (text) lines.push(`${e?.from === 'me' ? userName : String(e?.from || chatName || '对方')}: ${text}`);
+    }
+    lines.push(`[${kind}结束${m.duration ? `，时长 ${m.duration}` : ''}]`);
+    return lines.join('\n') + '\n';
+}
+
+// 把一批消息整理成给 AI 读的文本
+export function formatMessagesForSummary(msgs, chat, userName) {
+    const isGroup = chat?.type === 'group';
+    const chatName = chat?.name || '对方';
+    let out = '', lastDate = '';
+    for (const m of msgs || []) {
+        if (!isCountable(m)) continue;
+        if (m.date && m.date !== lastDate) { out += `--- ${m.date} ---\n`; lastDate = m.date; }
+        const t = m.time ? `[${m.time}] ` : '';
+        if (m.type === 'call_record') { out += describeCall(m, userName, chatName, t); continue; }
+        const speaker = m.from === 'me' ? userName
+            : (m.from === 'system' || m.type === 'system') ? '系统'
+                : (isGroup && m.from ? m.from : chatName);
+        out += `${t}${speaker}: ${describeMessage(m)}\n`;
+    }
+    return out.trim();
+}
+
+export function buildSummaryRequest({ oldSummary, transcript, chatName, isGroup, userName, maxChars }) {
+    const system = [
+        '你是微信聊天记录的摘要助手。你要把聊天记录压缩成一份给另一个 AI 阅读的备忘摘要，供它以后继续扮演聊天对象时参考。',
+        '要求：',
+        '1. 只保留对以后聊天有用的信息：双方关系和态度的变化、发生过的重要事件、约定和承诺、没有解决的事、双方的称呼和说话习惯、出现过的重要时间/地点/物品/数字。',
+        '2. 语音通话、视频通话里说的内容和聊天一样重要，同样要提炼进去。',
+        '3. 按时间顺序，用简洁的中文陈述句，不要逐句复述，不要写客套话，不要编造聊天里没有的内容。',
+        `4. 用真实名字称呼双方（用户叫「${userName}」），不要用“用户”“对方”这类泛称。`,
+        '5. 如果给了「已有摘要」，把新的聊天内容合并进去，输出一份完整的新摘要：旧摘要里仍然重要的要保留，已经不重要的细节可以压缩或删掉。',
+        `6. 只输出摘要正文，不要标题、不要解释、不要加引号。总长度不超过 ${maxChars} 字。`,
+    ].join('\n');
+    const user = [
+        `聊天窗口：${chatName}（${isGroup ? '群聊' : '单聊'}）`,
+        '',
+        '【已有摘要】',
+        oldSummary ? oldSummary : '（还没有）',
+        '',
+        '【需要并入摘要的新聊天记录】',
+        transcript,
+        '',
+        '请输出合并后的完整新摘要。',
+    ].join('\n');
+    return [{ role: 'system', content: system }, { role: 'user', content: user }];
+}
+
+export function cleanSummary(text, maxChars) {
+    let t = String(text ?? '');
+    t = t.replace(/<(think|thinking)>[\s\S]*?<\/\1>/gi, '').replace(/^```[a-z]*\n?|\n?```$/gi, '').trim();
+    t = t.replace(/^(摘要|新摘要|合并后的摘要)\s*[:：]\s*/, '').trim();
+    if (t.length > maxChars * 1.5) t = t.slice(0, Math.floor(maxChars * 1.5)) + '…';
+    return t;
+}
+
+// ---- 酒馆正文去重 ----
+// 手机往正文注入微信记录时，只会取「最近 N 条」，不会跳过已被压缩的消息。
+// 这里把正文里该聊天开头属于已压缩消息的那几条删掉（摘要已经覆盖了它们），保留手机原有的格式。
+
+const isTimeMarkerMsg = (m) => m?.isTimeMarker === true || m?.type === 'time_marker';
+
+// 手机正文注入里，一条消息会变成几条「[时间] 说话人: 内容」：接通的通话 = 1 + 通话里非空句数，其余 = 1
+export function entryCount(m, markersCount = true) {
+    if (isTimeMarkerMsg(m) && !markersCount) return 0;
+    if (m?.type === 'call_record' && m.status === 'answered' && Array.isArray(m.transcript)) {
+        return 1 + m.transcript.filter(x => String(x?.text ?? '').trim()).length;
+    }
+    return 1;
+}
+
+const ENTRY_RE = /^\[(?:\d{1,2}:\d{2}|undefined|null|)\] /;
+const DATE_RE = /^--- .+ ---$/;
+
+// body：某个聊天在正文里的记录文本（不含标题行）。去掉最前面的 drop 条，并校验总条数 = expectedTotal
+export function dropLeadingEntries(body, drop, expectedTotal) {
+    const trail = (body.match(/\s*$/) || [''])[0];
+    const lines = body.slice(0, body.length - trail.length).split('\n');
+    const total = lines.filter(l => ENTRY_RE.test(l)).length;
+    if (total !== expectedTotal) return { ok: false, body, total };
+    if (drop <= 0) return { ok: true, body, total, dropped: 0 };
+    let seen = 0, lastDate = '', i = 0;
+    for (; i < lines.length; i++) {
+        const l = lines[i];
+        if (DATE_RE.test(l)) { lastDate = l; if (seen >= drop) break; continue; }
+        if (ENTRY_RE.test(l)) { if (seen >= drop) break; seen++; }
+    }
+    const rest = lines.slice(i);
+    if (rest.length && lastDate && !DATE_RE.test(rest[0])) rest.unshift(lastDate); // 保证剩下的第一条前面还有日期
+    return { ok: true, body: rest.join('\n') + trail, total, dropped: drop };
+}
+
+const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// 在文本里每个聊天的标题行后面插入摘要。entries: [{ name, text, count }]
+export function injectSummaryIntoText(text, entries) {
+    if (typeof text !== 'string' || !text || text.includes(SUM_HEAD)) return text;
+    let out = text;
+    for (const e of entries) {
+        const name = escapeRe(e.name);
+        const block = `${SUM_HEAD}（更早的 ${e.count} 条聊天已被压缩成下面这段摘要，细节可能不全）\n${e.text}\n【以下是最近的原始聊天记录】\n`;
+        const r1 = new RegExp(`━━━ ${name} 的聊天记录 ━━━\\n`);        // 微信线上请求 / 正文注入
+        const r2 = new RegExp(`【💬 与 ${name} 的微信单聊记录】\\n[^\\n]*\\n`); // 电话里带的微信记录
+        const hit = r1.exec(out);
+        if (hit) {
+            const start = hit.index + hit[0].length;
+            let end = out.length;
+            if (e.trim) {
+                const next = /\n(?=━━━ |【)/g; next.lastIndex = start;
+                const nm = next.exec(out);
+                if (nm) end = nm.index + 1;
+                const seg = out.slice(start, end);
+                let res = { ok: false, body: seg };
+                for (const v of e.trim) { res = dropLeadingEntries(seg, v.drop, v.total); if (res.ok) break; }
+                e.trimResult = res.ok ? 'ok' : 'fail';
+                out = out.slice(0, hit.index) + hit[0] + block + res.body + out.slice(end);
+            } else {
+                out = out.slice(0, start) + block + out.slice(start);
+            }
+        }
+        else if (r2.test(out)) out = out.replace(r2, (m) => m + block);
+    }
+    return out;
+}
+
+// 返回新数组；没有变化返回原数组
+export function addSummariesToMessages(messages, entries) {
+    if (!Array.isArray(messages) || !entries?.length) return messages;
+    let changed = false;
+    const out = messages.map((m) => {
+        if (!m) return m;
+        if (typeof m.content === 'string') {
+            const next = injectSummaryIntoText(m.content, entries);
+            if (next === m.content) return m;
+            changed = true;
+            return { ...m, content: next };
+        }
+        if (Array.isArray(m.content)) {
+            let any = false;
+            const parts = m.content.map((p) => {
+                if (p && p.type === 'text' && typeof p.text === 'string') {
+                    const nt = injectSummaryIntoText(p.text, entries);
+                    if (nt !== p.text) { any = true; return { ...p, text: nt }; }
+                }
+                return p;
+            });
+            if (any) { changed = true; return { ...m, content: parts }; }
+        }
+        return m;
+    });
+    return changed ? out : messages;
+}
+
+/* ---- 存取 ---- */
+
+function phoneStorage() { return globalThis.VirtualPhone?.storage || null; }
+function getWD() {
+    const vp = globalThis.VirtualPhone;
+    return vp?.wechatApp?.wechatData || vp?.cachedWechatData || globalThis.ggp_currentWechatApp?.wechatData || null;
+}
+
+function readSummaries() {
+    try {
+        const raw = phoneStorage()?.get?.(SUM_KEY, {});
+        const o = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        return o && typeof o === 'object' ? o : {};
+    } catch { return {}; }
+}
+async function writeSummaries(o) { await phoneStorage()?.set?.(SUM_KEY, o); }
+
+// 有效的摘要：聊天还在，并且里面确实有被我们压缩过的消息（聊天被清空后，旧摘要不再使用）
+function summaryEntries(forMain = false) {
+    const wd = getWD();
+    if (!wd) return [];
+    const out = [];
+    for (const [id, rec] of Object.entries(readSummaries())) {
+        if (!rec?.text) continue;
+        try {
+            const chat = wd.getChat?.(id);
+            if (!chat?.name) continue;
+            const all = wd.getMessages(id) || [];
+            const n = all.filter(m => m?.ypPlusCompressed && !isTimeMarkerMsg(m)).length;
+            if (n > 0) out.push({ name: chat.name, text: rec.text, count: n, trim: forMain ? planTrim(all, chat) : null });
+        } catch { /* 忽略这个聊天 */ }
+    }
+    return out;
+}
+
+// 手机正文注入实际取的消息窗口 = 数组里最后 limit 条；算出里面开头有几条是已压缩的
+function planTrim(all, chat) {
+    const win = all.slice(-offlineLimit(chat));
+    // 有的版本时间标记也会变成一条注入内容，有的不会；两种算法都准备好，哪个和正文对得上用哪个
+    return [true, false].map((markersCount) => {
+        const total = win.reduce((a, m) => a + entryCount(m, markersCount), 0);
+        let drop = 0;
+        for (const m of win) { if (!m?.ypPlusCompressed) break; drop += entryCount(m, markersCount); }
+        return { drop, total };
+    });
+}
+
+// 手机正文注入实际用的条数上限（和手机一样：读不出来或为 0 就用默认值）
+function offlineLimit(chat) {
+    const st = phoneStorage();
+    const isGroup = chat?.type === 'group';
+    return parseInt(st?.get?.(isGroup ? 'offline-group-chat-limit' : 'offline-single-chat-limit'), 10) || (isGroup ? 10 : 30);
+}
+function toast(kind, msg) { try { globalThis.toastr?.[kind]?.(msg, '微信聊天摘要'); } catch { /* 忽略 */ } }
+
+const sumRunning = new Set();
+const sumFailedAt = new Map();
+
+// -> { status: 'done' | 'skip' | 'fail', reason? }
+export async function compressChat(chatId, { force = false, manual = false } = {}) {
+    chatId = String(chatId);
+    const s = getSettings();
+    const wd = getWD();
+    const holder = getCallAiHolder();
+    if (!wd || !holder) return { status: 'skip', reason: '手机还没加载好' };
+    if (sumRunning.has(chatId)) return { status: 'skip', reason: '正在压缩中' };
+    if (!force && !manual && Date.now() - (sumFailedAt.get(chatId) || 0) < SUM_RETRY_MS) return { status: 'skip', reason: '刚失败过，稍后重试' };
+    const chat = wd.getChat?.(chatId);
+    if (!chat) return { status: 'skip', reason: '找不到这个聊天' };
+    const msgs = wd.getMessages(chatId) || [];
+    const p = sumParams(s);
+    const plan = planCompression(msgs, { trigger: p.trigger, keepLines: p.keepLines, maxLines: p.take, force });
+    if (!plan) return { status: 'skip', reason: '还没到触发条数' };
+
+    const target = msgs.slice(0, plan.cut).filter(isCountable);
+    let userName = '用户';
+    try { userName = ctx().name1 || userName; } catch { /* 忽略 */ }
+    const rawOld = readSummaries()[chatId];
+    // 聊天被清空过（已没有被压缩的消息）时，旧摘要作废，不再并入新摘要
+    const old = msgs.some(m => m?.ypPlusCompressed) ? rawOld : null;
+    const req = buildSummaryRequest({
+        oldSummary: old?.text || '',
+        transcript: formatMessagesForSummary(target, chat, userName),
+        chatName: chat.name, isGroup: chat.type === 'group', userName, maxChars: p.maxChars,
+    });
+
+    sumRunning.add(chatId);
+    try {
+        const res = await holder.callAI(req, { appId: 'wechat', ypPlusInternal: true, temperature: 0.3 });
+        const text = cleanSummary(res?.summary ?? res?.content ?? res?.text, p.maxChars);
+        if (!res || res.success === false || !text) throw new Error(res?.error || 'AI 返回为空');
+        // 先存摘要，再隐藏原消息：中途出问题时，最坏只是摘要和原文同时存在，不会丢记录
+        const all = readSummaries();
+        all[chatId] = { text, at: Date.now(), rounds: (old?.rounds || 0) + 1 };
+        await writeSummaries(all);
+        for (const m of target) { m.hiddenFromPrompt = true; m.ypPlusCompressed = true; }
+        for (const m of msgs.slice(0, plan.cut)) if (isTimeMarkerMsg(m)) m.ypPlusCompressed = true; // 时间标记本来就不发给 AI，只做标记，方便正文去重时对数
+        if (wd._messagesDirty) wd._messagesDirty[chatId] = true;
+        await wd.saveData?.();
+        stats.summarized++;
+        sumFailedAt.delete(chatId);
+        toast('success', `「${chat.name}」的 ${plan.count} 条旧聊天已压缩成摘要`);
+        return { status: 'done', count: plan.count, chars: text.length };
+    } catch (e) {
+        sumFailedAt.set(chatId, Date.now());
+        stats.sumFailed++;
+        console.warn(LOG, '摘要失败', e);
+        toast('warning', `「${chat.name}」的摘要生成失败（${e?.message || e}）。聊天记录没有被改动，稍后会自动重试。`);
+        return { status: 'fail', reason: String(e?.message || e) };
+    } finally {
+        sumRunning.delete(chatId);
+    }
+}
+
+let sumChecking = false;
+async function checkSummaryTargets(manual = false) {
+    if (sumChecking) return;
+    sumChecking = true;
+    try {
+        const s = getSettings();
+        if (!s.sumEnabled) return;
+        const wd = getWD();
+        if (!wd) return;
+        const ids = new Set();
+        const cur = globalThis.VirtualPhone?.wechatApp?.currentChat?.id;
+        if (cur) ids.add(String(cur));
+        for (const c of wd.getChatList?.() || []) if (wd._messagesLoaded?.[c.id]) ids.add(String(c.id));
+        for (const id of ids) {
+            for (let i = 0; i < 6; i++) { // 积压很多时分批压，最多连压 6 批
+                const r = await compressChat(id, { manual });
+                if (r.status !== 'done') break;
+            }
+        }
+    } catch (e) {
+        console.warn(LOG, '摘要检查出错', e);
+    } finally {
+        sumChecking = false;
+    }
+}
+
+let sumTimer = null;
+function scheduleSummaryCheck() {
+    clearTimeout(sumTimer);
+    sumTimer = setTimeout(() => { checkSummaryTargets(); }, 8000); // 等手机把 AI 的回复都存好
+}
+
+// 撤销：把被压缩的消息恢复成普通消息，并删除所有摘要
+export async function undoAllSummaries() {
+    const wd = getWD();
+    let restored = 0;
+    if (wd) {
+        for (const c of wd.getChatList?.() || []) {
+            let n = 0;
+            for (const m of wd.getMessages(c.id) || []) {
+                if (m?.ypPlusCompressed) {
+                    delete m.ypPlusCompressed;
+                    if (!isTimeMarkerMsg(m)) { delete m.hiddenFromPrompt; n++; } // 时间标记本来就是隐藏的，不能取消
+                }
+            }
+            if (n) { if (wd._messagesDirty) wd._messagesDirty[c.id] = true; restored += n; }
+        }
+        await wd.saveData?.();
+    }
+    await writeSummaries({});
+    return restored;
+}
+
+// 酒馆正文：手机在发送前把「微信历史」塞进了请求，这里在它后面补上摘要
+function onPromptReady(data) {
+    try {
+        if (!getSettings().sumEnabled || !data || !Array.isArray(data.chat)) return;
+        const entries = summaryEntries(true);
+        if (!entries.length) return;
+        const next = addSummariesToMessages(data.chat, entries);
+        for (const e of entries) {
+            if (e.trimResult === 'ok') stats.sumTrimOk++;
+            else if (e.trimResult === 'fail') { stats.sumTrimFail++; console.warn(LOG, `「${e.name}」正文里的聊天记录条数和预期对不上，没有去掉已压缩的旧消息（摘要和这些旧消息会同时出现）`); }
+        }
+        if (next === data.chat) return;
+        for (let i = 0; i < next.length; i++) data.chat[i] = next[i];
+        stats.sumInjectedMain++;
+    } catch (e) {
+        console.warn(LOG, '正文摘要注入出错', e);
+    }
+}
+
 /* ================================================================== 酒馆接入 */
 
 function ctx() {
@@ -268,7 +780,7 @@ function safeSettings() {
     try { return getSettings(); } catch { return { ...DEFAULTS, memoryEnabled: false, smartScroll: false }; }
 }
 
-const stats = { containers: 0, blockedScrolls: 0, injected: 0, timeline: 0 };
+const stats = { containers: 0, blockedScrolls: 0, injected: 0, timeline: 0, cached: 0, summarized: 0, sumFailed: 0, sumInjectedMain: 0, sumTrimOk: 0, sumTrimFail: 0, sumInjectedPhone: 0 };
 
 /* ---- 记忆读取与缓存 ---- */
 
@@ -308,15 +820,33 @@ export function getMemory() {
 
 function prepareMessages(messages, options) {
     const s = getSettings();
-    if (!s.memoryEnabled) return messages;
     const appId = String(options?.appId || 'phone_online');
+    let out = withMemory(messages, s, appId);
+    if (s.sumEnabled) {
+        const entries = summaryEntries();
+        const withSum = entries.length ? addSummariesToMessages(out, entries) : out;
+        if (withSum !== out) stats.sumInjectedPhone++;
+        out = withSum;
+    }
+    if (s.cacheEnabled) {
+        const marked = addCacheBreakpoints(out, s.cacheTtl, appId);
+        const added = marked !== out;
+        if (added) stats.cached++;
+        out = marked;
+        if (s.log) console.info(LOG, `${appId}：缓存点 ${added ? '已添加' : '未添加'}`);
+    }
+    return out;
+}
+
+function withMemory(messages, s, appId) {
+    if (!s.memoryEnabled) return messages;
     if (Object.hasOwn(s.apps, appId) && s.apps[appId] === false) return messages;
     const mem = getMemory();
     if (!mem.text) {
         if (s.log) console.info(LOG, `${appId}：目前没有可用的小白X记忆`);
         return messages;
     }
-    const out = injectMemory(messages, mem.text, { intro: s.intro, maxChars: Number(s.maxChars) || 0 });
+    const out = injectMemory(messages, mem.text, { intro: s.intro, maxChars: Number(s.maxChars) || 0, appId });
     if (out !== messages) stats.injected++;
     if (s.log) {
         console.info(LOG, `${appId}：${out === messages ? '已存在，跳过' : '已注入'} ` +
@@ -340,9 +870,15 @@ function tryPatchApi() {
     if (holder.callAI[PATCHED]) return true;
     const original = holder.callAI;
     const wrapped = function (messages, options) {
+        if (options?.ypPlusInternal) return original.call(this, messages, options); // 摘要自己的请求：不加记忆/缓存点
         let next = messages;
         try { next = prepareMessages(messages, options || {}); } catch (e) { console.error(LOG, e); }
-        return original.call(this, next, options);
+        const result = original.call(this, next, options);
+        try {
+            const id = String(options?.appId || 'phone_online');
+            if (id === 'wechat' || id === 'phone_online') Promise.resolve(result).then(scheduleSummaryCheck, scheduleSummaryCheck);
+        } catch { /* 忽略 */ }
+        return result;
     };
     wrapped[PATCHED] = true;
     holder.callAI = wrapped;
@@ -420,6 +956,37 @@ function startScrollObserver() {
 
 /* ---- 设置面板（中文） ---- */
 
+function s_cacheLine() {
+    let on = false; try { on = !!getSettings().cacheEnabled; } catch { /* 忽略 */ }
+    return on ? `手机缓存点：已开启（已给 ${stats.cached} 次手机请求打了缓存点）` : '手机缓存点：已关闭';
+}
+
+function s_sumLines() {
+    let s; try { s = getSettings(); } catch { return []; }
+    if (!s.sumEnabled) return ['微信聊天摘要：已关闭'];
+    const p = sumParams(s);
+    const out = [`微信聊天摘要：已开启（满 ${p.trigger} 条，压缩最老的 ${p.take} 条，留下约 ${p.keepLines} 条原文）`];
+    const wd = getWD();
+    if (!wd) { out.push('  手机的微信数据还没加载（先打开一次微信 App，或发一条微信消息）'); return out; }
+    const sums = readSummaries();
+    const rows = [];
+    for (const c of wd.getChatList?.() || []) {
+        const loaded = !!wd._messagesLoaded?.[c.id];
+        const rec = sums[c.id];
+        if (!loaded && !rec) continue;
+        const msgs = loaded ? (wd.getMessages(c.id) || []) : [];
+        const lines = visibleLines(msgs);
+        const shown = msgs.filter(isCountable).length;
+        const lim = offlineLimit(c);
+        const warn = loaded && shown > lim ? `\n    ⚠ 小手机「线下注入条数」是 ${lim}，小于当前原文 ${shown} 条，酒馆正文里会漏掉中间的 ${shown - lim} 条。请把它调到 ${p.trigger + 100} 以上。` : '';
+        rows.push(`  · ${c.name}${c.type === 'group' ? '（群）' : ''}：当前原文 ${lines} 条` + (rec ? `；摘要 ${rec.text.length} 字（已压缩 ${rec.rounds || 1} 次）` : '；还没有摘要') + warn);
+    }
+    out.push(...(rows.length ? rows : ['  （目前没有已加载的聊天）']));
+    out.push(`  已压缩 ${stats.summarized} 次，失败 ${stats.sumFailed} 次；摘要已带进手机请求 ${stats.sumInjectedPhone} 次、酒馆正文 ${stats.sumInjectedMain} 次`);
+    if (stats.sumTrimFail) out.push(`  ⚠ 正文去重有 ${stats.sumTrimFail} 次没对上（已压缩的旧消息和摘要同时出现，不会丢信息，只是重复）。`);
+    return out;
+}
+
 function describeStatus() {
     const holder = getCallAiHolder();
     const hooked = !!holder?.callAI?.[PATCHED];
@@ -431,6 +998,8 @@ function describeStatus() {
     else if (mem.source === 'cache') lines.push(`小白X记忆：${mem.text.length} 字（使用 ${new Date(mem.at).toLocaleString()} 保存的副本）`);
     else lines.push('小白X记忆：暂无。请先用开启了小白X记忆的聊天生成一次正文回复。');
     lines.push(`已向手机请求注入记忆：${stats.injected} 次`);
+    lines.push(s_cacheLine());
+    lines.push(...s_sumLines());
     lines.push(`通话界面：已接管 ${stats.containers} 个（当前打开 ${live} 个），已拦截强制滚动 ${stats.blockedScrolls} 次`);
     lines.push(Object.getPrototypeOf(globalThis.VirtualPhone?.wechatApp?.chatView || {})?.[Symbol.for('yuzuki_phone_plus.chatview_patched2')]
         ? `微信时间推进：已生效（已处理 ${stats.timeline} 条消息）`
@@ -447,7 +1016,7 @@ function mountSettings() {
     const html = `
     <div id="yp_plus_settings" class="inline-drawer">
       <div class="inline-drawer-toggle inline-drawer-header">
-        <b>柚月小手机增强（小白X记忆 + 智能滚动 + 微信时间）</b>
+        <b>柚月小手机增强（小白X记忆 + 缓存点 + 微信聊天摘要 + 智能滚动 + 微信时间）</b>
         <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
       </div>
       <div class="inline-drawer-content">
@@ -463,6 +1032,23 @@ function mountSettings() {
           <input type="button" id="yp_plus_reset_intro" class="menu_button" value="恢复默认说明句">
           <input type="button" id="yp_plus_clear" class="menu_button" value="清除已保存的记忆副本">
         </div>
+        <h4 style="margin:12px 0 6px">手机请求的缓存点</h4>
+        <label class="checkbox_label"><input type="checkbox" id="yp_plus_cache"><span>给手机的 AI 请求自动打缓存点（要求：你的 API 走 gproxy，并且渠道里打开了 Magic-string cache）</span></label>
+        <div style="margin:6px 0 2px">缓存时长</div>
+        <select id="yp_plus_ttl" class="text_pole" style="width:200px"><option value="5m">5 分钟（默认，便宜）</option><option value="1h">1 小时（写入贵一倍）</option></select>
+        <h4 style="margin:12px 0 6px">微信聊天自动摘要</h4>
+        <label class="checkbox_label"><input type="checkbox" id="yp_plus_sum"><span>微信聊天（含语音、视频通话）太多时，自动把最老的压缩成摘要，不再直接丢掉</span></label>
+        <div style="margin:6px 0 2px">满多少条触发压缩（通话里说的每句话也算一条）</div>
+        <input type="number" min="40" max="9999" step="10" id="yp_plus_sum_trigger" class="text_pole" style="width:120px">
+        <div style="margin:6px 0 2px">每次压缩最老的多少条（剩下的原文保留）</div>
+        <input type="number" min="10" max="9990" step="10" id="yp_plus_sum_take" class="text_pole" style="width:120px">
+        <div style="margin:6px 0 2px">摘要大致字数上限</div>
+        <input type="number" min="300" max="8000" step="100" id="yp_plus_sum_max" class="text_pole" style="width:120px">
+        <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap">
+          <input type="button" id="yp_plus_sum_now" class="menu_button" value="现在检查并压缩">
+          <input type="button" id="yp_plus_sum_undo" class="menu_button" value="撤销全部摘要（恢复原文）">
+        </div>
+        <small>摘要会作为「手机微信聊天记录」最前面的一段，同时带进手机的 AI 请求和酒馆正文。被压缩的老消息在手机里照常能看到，只是不再发给 AI。</small>
         <h4 style="margin:12px 0 6px">通话智能滚动</h4>
         <label class="checkbox_label"><input type="checkbox" id="yp_plus_smart"><span>我往上翻看通话消息时，不要再自动拉到最底部</span></label>
         <label class="checkbox_label"><input type="checkbox" id="yp_plus_send"><span>我自己发消息时，总是滚到最底部</span></label>
@@ -488,10 +1074,31 @@ function mountSettings() {
     $('#yp_plus_intro').val(s.intro).on('input', function () { s.intro = this.value; save(); });
     $('#yp_plus_reset_intro').on('click', () => { s.intro = DEFAULT_INTRO; $('#yp_plus_intro').val(s.intro); save(); });
     $('#yp_plus_clear').on('click', () => { clearCache(); $('#yp_plus_status').text('已清除保存的记忆副本。'); });
+    $('#yp_plus_cache').prop('checked', s.cacheEnabled).on('change', function () { s.cacheEnabled = this.checked; save(); });
+    $('#yp_plus_ttl').val(s.cacheTtl).on('change', function () { s.cacheTtl = this.value === '1h' ? '1h' : '5m'; save(); });
     $('#yp_plus_smart').prop('checked', s.smartScroll).on('change', function () { s.smartScroll = this.checked; save(); });
     $('#yp_plus_send').prop('checked', s.alwaysScrollOnSend).on('change', function () { s.alwaysScrollOnSend = this.checked; save(); });
     $('#yp_plus_time').prop('checked', s.timeEnabled).on('change', function () { s.timeEnabled = this.checked; save(); });
     $('#yp_plus_speed').val(s.speedPercent).on('change', function () { const n = Number(this.value); s.speedPercent = Number.isFinite(n) && n > 0 ? Math.min(500, Math.max(10, n)) : 100; save(); });
+    $('#yp_plus_sum').prop('checked', s.sumEnabled).on('change', function () { s.sumEnabled = this.checked; save(); });
+    const sumNum = (sel, key, lo, hi) => $(sel).val(s[key]).on('change', function () {
+        const n = parseInt(this.value, 10);
+        s[key] = Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : DEFAULTS[key];
+        this.value = s[key]; save();
+    });
+    sumNum('#yp_plus_sum_trigger', 'sumTrigger', 40, 9999);
+    sumNum('#yp_plus_sum_take', 'sumTake', 10, 9990);
+    sumNum('#yp_plus_sum_max', 'sumMaxChars', 300, 8000);
+    $('#yp_plus_sum_now').on('click', async () => {
+        $('#yp_plus_status').text('正在检查……（需要压缩时会调用 AI，请稍等）');
+        await checkSummaryTargets(true);
+        $('#yp_plus_status').text(describeStatus().text);
+    });
+    $('#yp_plus_sum_undo').on('click', async () => {
+        if (!globalThis.confirm('确定撤销？所有被压缩的消息会恢复成普通消息（重新发给 AI），已生成的摘要会被删除。')) return;
+        const n = await undoAllSummaries();
+        $('#yp_plus_status').text(`已恢复 ${n} 条消息，并删除了全部摘要。`);
+    });
     $('#yp_plus_check').on('click', () => {
         const st = describeStatus();
         const preview = st.memory ? `\n\n记忆预览：\n${st.memory.slice(0, 300)}${st.memory.length > 300 ? ' ……' : ''}` : '';
@@ -509,6 +1116,8 @@ function snapshotAfterGeneration() {
         const { eventSource, event_types: ev } = c;
         if (eventSource && ev) {
             if (ev.APP_READY) eventSource.on(ev.APP_READY, () => { mountSettings(); startApiPatching(); startScrollObserver(); startChatViewPatching(); });
+            if (ev.CHAT_COMPLETION_PROMPT_READY) eventSource.on(ev.CHAT_COMPLETION_PROMPT_READY, onPromptReady); // 在手机注入之后补上摘要
+            for (const name of ['MESSAGE_RECEIVED', 'GENERATION_ENDED']) if (ev[name]) eventSource.on(ev[name], scheduleSummaryCheck);
             // 每次正文生成后刷新记忆副本
             for (const name of ['GENERATION_ENDED', 'CHAT_COMPLETION_PROMPT_READY', 'MESSAGE_RECEIVED']) {
                 if (ev[name]) eventSource.on(ev[name], snapshotAfterGeneration);
