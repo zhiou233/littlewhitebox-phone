@@ -620,7 +620,7 @@ function offlineLimit(chat) {
     const isGroup = chat?.type === 'group';
     return parseInt(st?.get?.(isGroup ? 'offline-group-chat-limit' : 'offline-single-chat-limit'), 10) || (isGroup ? 10 : 30);
 }
-function toast(kind, msg) { try { globalThis.toastr?.[kind]?.(msg, '微信聊天摘要'); } catch { /* 忽略 */ } }
+function toast(kind, msg, opts) { try { globalThis.toastr?.[kind]?.(msg, '微信聊天摘要', opts); } catch { /* 忽略 */ } }
 
 // 当前是哪一个酒馆聊天（角色卡 / 群 / 聊天文件）。摘要请求要等 AI 返回，期间如果你切了聊天，结果必须作废
 function tavernKey() {
@@ -649,7 +649,7 @@ export async function compressChat(chatId, { force = false, manual = false } = {
     const msgs = wd.getMessages(chatId) || [];
     const p = sumParams(s);
     const plan = planCompression(msgs, { trigger: p.trigger, keepLines: p.keepLines, maxLines: p.take, force });
-    if (!plan) return { status: 'skip', reason: '还没到触发条数' };
+    if (!plan) return { status: 'skip', reason: `还没到触发条数（现在 ${visibleLines(msgs)} 条，满 ${p.trigger} 条才会压缩）` };
 
     const target = msgs.slice(0, plan.cut).filter(isCountable);
     let userName = '用户';
@@ -664,6 +664,7 @@ export async function compressChat(chatId, { force = false, manual = false } = {
     });
 
     sumRunning.add(runKey);
+    toast('info', `正在把「${chat.name}」的 ${plan.count} 条旧聊天压缩成摘要，请稍等（需要调用一次 AI）。`, { timeOut: 6000 });
     try {
         const res = await holder.callAI(req, { appId: 'wechat', ypPlusInternal: true, temperature: 0.3 });
         const text = cleanSummary(res?.summary ?? res?.content ?? res?.text, p.maxChars);
@@ -698,27 +699,39 @@ export async function compressChat(chatId, { force = false, manual = false } = {
     }
 }
 
+// 返回每个微信窗口的检查结果（手动点按钮时显示给用户）
 let sumChecking = false;
-async function checkSummaryTargets(manual = false) {
-    if (sumChecking) return;
+export async function checkSummaryTargets(manual = false) {
+    if (sumChecking) return [{ name: '（全部）', text: '上一次检查还在进行中，请稍等。' }];
     sumChecking = true;
+    const report = [];
     try {
         const s = getSettings();
-        if (!s.sumEnabled) return;
+        if (!s.sumEnabled) return [{ name: '（全部）', text: '「微信聊天自动摘要」没有开启，所以什么都没做。' }];
         const wd = getWD();
-        if (!wd) return;
+        if (!wd) return [{ name: '（全部）', text: '手机的微信数据还没加载（先打开一次微信 App，或发一条微信消息）。' }];
         const ids = new Set();
         const cur = globalThis.VirtualPhone?.wechatApp?.currentChat?.id;
         if (cur) ids.add(String(cur));
         for (const c of wd.getChatList?.() || []) if (wd._messagesLoaded?.[c.id]) ids.add(String(c.id));
+        if (!ids.size) return [{ name: '（全部）', text: '目前没有已加载的微信聊天。' }];
         for (const id of ids) {
+            const name = wd.getChat?.(id)?.name || id;
+            let done = 0, last = null;
             for (let i = 0; i < 6; i++) { // 积压很多时分批压，最多连压 6 批
                 const r = await compressChat(id, { manual });
+                last = r;
                 if (r.status !== 'done') break;
+                done += r.count || 0;
             }
+            if (done) report.push({ name, text: `已把 ${done} 条旧聊天压缩成摘要。` });
+            else if (last?.status === 'fail') report.push({ name, text: `压缩失败：${last.reason}（聊天记录没有被改动）` });
+            else report.push({ name, text: `没有压缩。${last?.reason || ''}` });
         }
+        return report;
     } catch (e) {
         console.warn(LOG, '摘要检查出错', e);
+        return [{ name: '（全部）', text: `检查出错：${e?.message || e}` }];
     } finally {
         sumChecking = false;
     }
@@ -1200,14 +1213,14 @@ function s_sumLines() {
         const shown = msgs.filter(isCountable).length;
         const lim = offlineLimit(c);
         const warn = loaded && shown > lim ? `\n    ⚠ 小手机「线下注入条数」是 ${lim}，小于当前原文 ${shown} 条，酒馆正文里会漏掉中间的 ${shown - lim} 条。请把它调到 ${p.trigger + 100} 以上。` : '';
-        rows.push(`  · ${c.name}${c.type === 'group' ? '（群）' : ''}：当前原文 ${lines} 条` + (rec ? `；摘要 ${rec.text.length} 字（已压缩 ${rec.rounds || 1} 次）` : '；还没有摘要') + warn);
+        rows.push(`  · ${c.name}${c.type === 'group' ? '（群）' : ''}：` + (isSummaryBusy(c.id) ? '【正在压缩中……】' : '') + `当前原文 ${lines} 条` + (rec ? `；摘要 ${rec.text.length} 字（已压缩 ${rec.rounds || 1} 次）` : '；还没有摘要') + warn);
     }
     out.push(...(rows.length ? rows : ['  （目前没有已加载的聊天）']));
     if (stats.sumTrimFail) out.push(`  ⚠ 正文去重有 ${stats.sumTrimFail} 次没对上（已压缩的旧消息和摘要同时出现，不会丢信息，只是重复）。`);
     return out;
 }
 
-function describeStatus() {
+export function describeStatus() {
     const holder = getCallAiHolder();
     const hooked = !!holder?.callAI?.[PATCHED];
     const mem = getMemory();
@@ -1239,7 +1252,7 @@ export function renderSumPanel() {
     box.append($('<small>').text('这里是「当前打开的这个酒馆聊天」里，每个微信窗口的摘要（文字、语音、视频通话合在一份里）。改完点「保存修改」，下一次手机请求和酒馆正文就会用新的文字。'));
     for (const it of list) {
         const wrap = $('<div>').css({ margin: '8px 0', padding: '8px', border: '1px solid var(--SmartThemeBorderColor, #888)', borderRadius: '6px' });
-        wrap.append($('<div>').css('font-weight', 'bold').text(`${it.name}${it.isGroup ? '（群）' : ''}`));
+        wrap.append($('<div>').css('font-weight', 'bold').text(`${it.name}${it.isGroup ? '（群）' : ''}${isSummaryBusy(it.id) ? '　【正在压缩中……，完成前不能保存或撤销】' : ''}`));
         const bits = [`已压缩 ${it.rounds} 次`];
         if (it.at) bits.push(`最后更新 ${new Date(it.at).toLocaleString()}`);
         if (it.exists) bits.push(`对应 ${it.count} 条已压缩的聊天`);
@@ -1383,8 +1396,8 @@ function mountSettings() {
     sumNum('#yp_plus_sum_max', 'sumMaxChars', 300, 8000);
     $('#yp_plus_sum_now').on('click', async () => {
         $('#yp_plus_status').text('正在检查……（需要压缩时会调用 AI，请稍等）');
-        await checkSummaryTargets(true);
-        $('#yp_plus_status').text(describeStatus().text);
+        const report = await checkSummaryTargets(true);
+        $('#yp_plus_status').text(['检查结果：', ...report.map(r => `· ${r.name}：${r.text}`), '', describeStatus().text].join('\n'));
     });
     $('#yp_plus_sum_undo').on('click', async () => {
         if (!globalThis.confirm('确定撤销？所有被压缩的消息会恢复成普通消息（重新发给 AI），已生成的摘要会被删除。')) return;
