@@ -1,4 +1,4 @@
-// 柚月小手机增强（小白X记忆 + 智能滚动）
+// 柚月小手机增强（小白X记忆 + 智能滚动 + 微信时间）
 //
 // 功能一：小白X记忆桥接
 //   柚月小手机里的 AI 请求（微信 / 朋友圈 / 微博 / X / 日记…）是手机自己拼提示词，不走酒馆的生成流程，
@@ -50,10 +50,8 @@ export const DEFAULTS = Object.freeze({
     apps: Object.freeze(Object.fromEntries(APPS.map(([id]) => [id, true]))),
     smartScroll: true,
     alwaysScrollOnSend: true,
-    timelineEnabled: true,   // 压缩微信里 AI 连发消息的时间跨度
-    noExtraGap: true,        // 取消「连发短消息时第 3 条起额外拉开 1~3 分钟」
-    maxMinutesPerMsg: 0,     // 每条消息最多推进几分钟（0 = 只按秒推进）
-    readSpeedPercent: 50,    // 每条消息的「阅读/思考」用时占原来的百分比（100 = 原样）
+    timeEnabled: true,       // 微信连发消息：放慢时间推进
+    roundMinutes: 6,         // 一轮回复（按 20 条算）的总时长，分钟
     log: false,
 });
 
@@ -130,65 +128,102 @@ export function isOwnMessageHtml(html) {
     return OWN_MESSAGE_RE.test(String(html || ''));
 }
 
-/* ================================================================== 功能三：微信连发消息时间压缩 */
-// 手机里「线上」微信聊天的时间完全由插件自己推进（会忽略 AI 写的时间）：
-//   每条消息按字数推进 0~3 分钟 + 阅读耗时 4~55 秒；
-//   连续 3 条以上的短消息，从第 3 条起每条再额外加 1~3 分钟；
-//   两条消息相距 3 分钟以上，聊天里就会出现一个时间胶囊把它们「分块」。
-// 下面三个函数把这几处改小。
+/* ================================================================== 功能三：微信连发消息的时间推进 */
+// 手机里「线上」微信聊天的时间由手机自己推进（忽略 AI 写的时间），原版每条消息要推进几分钟，
+// 一轮连发十几二十条就会跨十几分钟，中间出现好几个时间胶囊。
+// 这里改成：一轮回复的总时长固定在「设定分钟数」以内（默认 6 分钟，一轮 20 条左右刚好用满），
+// 每条消息按字数分到几十秒，总时长封顶。
+// 聊天界面「距离上一个时间胶囊满 3 分钟才出现新的」是手机自带规则，这里不动，
+// 所以一轮 6 分钟里通常出现 1~2 个时间胶囊。
 
-export function scaleSeconds(seconds, percent) {
-    const p = Number.isFinite(Number(percent)) ? Math.max(0, Number(percent)) : 100;
-    if (p >= 100) return seconds;
-    return Math.max(1, Math.round(seconds * p / 100));
+const ASSUMED_MESSAGES_PER_ROUND = 15; // 按「一轮 20 条左右刚好用满总时长」来分配每条的时间（短句占的时间少，所以按 15 折算）
+
+// 一条消息要推进多少毫秒（不含「封顶」）
+export function stepMs(textLength, roundMinutes, rand = Math.random) {
+    const minutes = Math.max(0.5, Number(roundMinutes) || 6);
+    const perMsg = minutes * 60 * 1000 / ASSUMED_MESSAGES_PER_ROUND;
+    const weight = Math.min(1.5, Math.max(0.5, 0.5 + (Number(textLength) || 0) / 30)); // 短句快、长句慢
+    return perMsg * weight * (0.85 + rand() * 0.3);
 }
 
-export function capMinutes(minutes, maxMinutes) {
-    const cap = Number.isFinite(Number(maxMinutes)) ? Math.max(0, Math.floor(Number(maxMinutes))) : Infinity;
-    return Math.min(Number(minutes) || 0, cap);
+// 这条消息实际推进多少毫秒：一轮开头的第一条只推几秒；封顶后每条只推 1 秒（保持先后顺序）
+export function advanceMs({ isFirst, elapsedMs, roundMinutes, textLength, rand = Math.random }) {
+    if (isFirst) return 5000 + Math.floor(rand() * 7000);
+    const roundMs = Math.max(0.5, Number(roundMinutes) || 6) * 60 * 1000;
+    const remain = roundMs - Math.max(0, Number(elapsedMs) || 0);
+    return Math.max(1000, Math.min(stepMs(textLength, roundMinutes, rand), remain));
 }
 
-const CV_PATCHED = Symbol.for('yuzuki_phone_plus.chatview_patched');
+const CV_PATCHED = Symbol.for('yuzuki_phone_plus.chatview_patched2');
+
+function currentBaseTimestamp(view, tm) {
+    const own = Number(view._aiReplyTimestampCursor);
+    if (Number.isFinite(own) && own > 0) return own;
+    const cur = view._aiReplyTimeCursor || tm?.getCurrentStoryTime?.();
+    if (!cur) return 0;
+    const ts = Number(cur.timestamp);
+    if (Number.isFinite(ts) && ts > 0) return ts;
+    const parsed = Number(tm?.parseTimeToTimestamp?.(cur));
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
 
 export function patchChatViewProto(proto) {
     if (!proto || proto[CV_PATCHED]) return false;
-    const needed = ['_buildShortWechatReplyGapMap', '_getWechatReplySecondsToAdd', '_applyAiReplyTimeline'];
+    const needed = ['_applyAiReplyTimeline', '_buildShortWechatReplyGapMap',
+        '_formatWechatTimeFromTimestamp', '_formatWechatDateFromTimestamp'];
     if (!needed.every(n => typeof proto[n] === 'function')) return false; // 手机改了内部名称：不处理
     proto[CV_PATCHED] = true;
 
+    // 取消「连发短消息时第 3 条起额外加 1~3 分钟」
     const origGap = proto._buildShortWechatReplyGapMap;
     proto._buildShortWechatReplyGapMap = function (...args) {
-        const s = safeSettings();
-        if (s.timelineEnabled && s.noExtraGap) return new Map();
-        return origGap.apply(this, args);
-    };
-
-    const origSec = proto._getWechatReplySecondsToAdd;
-    proto._getWechatReplySecondsToAdd = function (...args) {
-        const v = origSec.apply(this, args);
-        const s = safeSettings();
-        if (!s.timelineEnabled) return v;
-        stats.timeline++;
-        return scaleSeconds(v, s.readSpeedPercent);
+        return safeSettings().timeEnabled ? new Map() : origGap.apply(this, args);
     };
 
     const origApply = proto._applyAiReplyTimeline;
-    proto._applyAiReplyTimeline = function (...args) {
+    proto._applyAiReplyTimeline = function (msg, fallback, options = {}) {
         const s = safeSettings();
         const tm = globalThis.VirtualPhone?.timeManager;
-        const hasHook = s.timelineEnabled && tm && typeof tm.getWechatMessageMinutesToAdd === 'function';
-        if (!hasHook) return origApply.apply(this, args);
-        // 只在本次计算期间，给「每条消息推进几分钟」加上限，算完立即还原
-        const had = Object.hasOwn(tm, 'getWechatMessageMinutesToAdd');
-        const orig = tm.getWechatMessageMinutesToAdd;
-        tm.getWechatMessageMinutesToAdd = function (...a) { return capMinutes(orig.apply(this, a), s.maxMinutesPerMsg); };
         try {
-            return origApply.apply(this, args);
-        } finally {
-            if (had) tm.getWechatMessageMinutesToAdd = orig; else delete tm.getWechatMessageMinutesToAdd;
+            if (!s.timeEnabled || !msg || typeof msg !== 'object' || !tm) return origApply.call(this, msg, fallback, options);
+            // 「线上时间按现实时间」模式：手机本来就按真实时间走，不处理
+            if (typeof this._shouldUseRealTimeForOnlineChat === 'function' && this._shouldUseRealTimeForOnlineChat(options)) {
+                return origApply.call(this, msg, fallback, options);
+            }
+            const isRoundStart = options?.isFirstInReplyBatch === true || !(Number(this._aiReplyTimestampCursor) > 0);
+            let base = currentBaseTimestamp(this, tm);
+            if (!(base > 0)) return origApply.call(this, msg, fallback, options);
+            if (isRoundStart) {
+                // 角色主动找你时，手机会给出「剧情里过了多久」，这个间隔保留
+                base += Math.max(0, Number(options?.extraGapMinutes) || 0) * 60 * 1000;
+                this._ypRoundStart = base;
+            } else if (!(Number(this._ypRoundStart) > 0)) {
+                this._ypRoundStart = base;
+            }
+            const text = String(msg.content || fallback || '').replace(/\s+/g, '');
+            const add = advanceMs({
+                isFirst: isRoundStart, elapsedMs: base - this._ypRoundStart,
+                roundMinutes: s.roundMinutes, textLength: text.length,
+            });
+            const ts = base + add;
+            const prev = this._aiReplyTimeCursor || tm.getCurrentStoryTime?.() || {};
+            msg.time = this._formatWechatTimeFromTimestamp(ts) || msg.time;
+            msg.date = this._formatWechatDateFromTimestamp(ts) || msg.date;
+            msg.weekday = this._getWechatWeekdayFromTimestamp?.(ts, prev.weekday) ?? msg.weekday ?? prev.weekday;
+            msg.timestamp = ts;
+            if (typeof tm.setTime === 'function' && msg.time && msg.date) {
+                tm.setTime(msg.time, msg.date, msg.weekday || null);
+                globalThis.VirtualPhone?.checkCalendarScheduleReminders?.(tm.getCurrentStoryTime?.() || { time: msg.time, date: msg.date, weekday: msg.weekday });
+            }
+            this._aiReplyTimeCursor = tm.getCurrentStoryTime?.() || { time: msg.time, date: msg.date, weekday: msg.weekday, timestamp: ts };
+            this._aiReplyTimestampCursor = ts;
+            stats.timeline++;
+        } catch (e) {
+            console.error(LOG, '时间推进出错，改用手机原来的算法', e);
+            return origApply.call(this, msg, fallback, options);
         }
     };
-    console.info(LOG, '已挂接微信连发消息的时间计算');
+    console.info(LOG, '已挂接微信连发消息的时间推进');
     return true;
 }
 
@@ -203,7 +238,6 @@ function startChatViewPatching() {
     // 微信 App 是懒加载的；等它出现
     const timer = setInterval(() => { if (tryPatchChatView()) clearInterval(timer); }, 2000);
 }
-
 /* ================================================================== 酒馆接入 */
 
 function ctx() {
@@ -397,9 +431,9 @@ function describeStatus() {
     else lines.push('小白X记忆：暂无。请先用开启了小白X记忆的聊天生成一次正文回复。');
     lines.push(`已向手机请求注入记忆：${stats.injected} 次`);
     lines.push(`通话界面：已接管 ${stats.containers} 个（当前打开 ${live} 个），已拦截强制滚动 ${stats.blockedScrolls} 次`);
-    lines.push(Object.getPrototypeOf(globalThis.VirtualPhone?.wechatApp?.chatView || {})?.[Symbol.for('yuzuki_phone_plus.chatview_patched')]
-        ? `微信时间压缩：已挂接（已处理 ${stats.timeline} 条消息）`
-        : '微信时间压缩：未就绪（先打开一次微信 App；若打开后仍未就绪，说明手机内部改名，需要适配）');
+    lines.push(Object.getPrototypeOf(globalThis.VirtualPhone?.wechatApp?.chatView || {})?.[Symbol.for('yuzuki_phone_plus.chatview_patched2')]
+        ? `微信时间推进：已生效（已处理 ${stats.timeline} 条消息）`
+        : '微信时间推进：还没生效（先打开一次微信 App；打开后仍这样，说明手机内部改了名字，需要适配）');
     return { text: lines.join('\n'), memory: mem.text };
 }
 
@@ -412,7 +446,7 @@ function mountSettings() {
     const html = `
     <div id="yp_plus_settings" class="inline-drawer">
       <div class="inline-drawer-toggle inline-drawer-header">
-        <b>柚月小手机增强（小白X记忆 + 智能滚动 + 微信连发时间）</b>
+        <b>柚月小手机增强（小白X记忆 + 智能滚动 + 微信时间）</b>
         <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
       </div>
       <div class="inline-drawer-content">
@@ -431,14 +465,10 @@ function mountSettings() {
         <h4 style="margin:12px 0 6px">通话智能滚动</h4>
         <label class="checkbox_label"><input type="checkbox" id="yp_plus_smart"><span>我往上翻看通话消息时，不要再自动拉到最底部</span></label>
         <label class="checkbox_label"><input type="checkbox" id="yp_plus_send"><span>我自己发消息时，总是滚到最底部</span></label>
-        <h4 style="margin:12px 0 6px">微信连发消息的时间间隔</h4>
-        <label class="checkbox_label"><input type="checkbox" id="yp_plus_tl"><span>压缩 AI 连发消息的时间跨度（避免一次回复被时间胶囊分成好几块）</span></label>
-        <label class="checkbox_label"><input type="checkbox" id="yp_plus_nogap"><span>取消「连发 3 条以上短消息时，从第 3 条起每条额外加 1~3 分钟」</span></label>
-        <div style="margin:6px 0 2px">每条消息最多推进几分钟（0 = 不按字数推进分钟，只按秒推进；手机原样最多 3）</div>
-        <input type="number" min="0" max="10" step="1" id="yp_plus_maxmin" class="text_pole" style="width:120px">
-        <div style="margin:6px 0 2px">每条消息的阅读用时占原来的百分比（100 = 手机原样，50 = 缩短一半，越小越快）</div>
-        <input type="number" min="0" max="100" step="5" id="yp_plus_speed" class="text_pole" style="width:120px">
-        <h4 style="margin:12px 0 6px">其他</h4>
+        <h4 style="margin:12px 0 6px">微信连发消息的时间</h4>
+        <label class="checkbox_label"><input type="checkbox" id="yp_plus_time"><span>放慢微信里 AI 连发消息的时间推进</span></label>
+        <div style="margin:6px 0 2px">一轮回复（20 条左右）的总时长上限，单位：分钟（默认 6）</div>
+        <input type="number" min="1" max="60" step="1" id="yp_plus_round" class="text_pole" style="width:120px">        <h4 style="margin:12px 0 6px">其他</h4>
         <label class="checkbox_label"><input type="checkbox" id="yp_plus_log"><span>在控制台输出调试日志</span></label>
         <div style="margin-top:8px"><input type="button" id="yp_plus_check" class="menu_button" value="检查状态"></div>
         <pre id="yp_plus_status" style="white-space:pre-wrap;margin:8px 0 0"></pre>
@@ -458,11 +488,8 @@ function mountSettings() {
     $('#yp_plus_clear').on('click', () => { clearCache(); $('#yp_plus_status').text('已清除保存的记忆副本。'); });
     $('#yp_plus_smart').prop('checked', s.smartScroll).on('change', function () { s.smartScroll = this.checked; save(); });
     $('#yp_plus_send').prop('checked', s.alwaysScrollOnSend).on('change', function () { s.alwaysScrollOnSend = this.checked; save(); });
-    $('#yp_plus_tl').prop('checked', s.timelineEnabled).on('change', function () { s.timelineEnabled = this.checked; save(); });
-    $('#yp_plus_nogap').prop('checked', s.noExtraGap).on('change', function () { s.noExtraGap = this.checked; save(); });
-    $('#yp_plus_maxmin').val(s.maxMinutesPerMsg).on('change', function () { s.maxMinutesPerMsg = Math.max(0, parseInt(this.value, 10) || 0); save(); });
-    $('#yp_plus_speed').val(s.readSpeedPercent).on('change', function () { const n = Number(this.value); s.readSpeedPercent = Number.isFinite(n) ? Math.min(100, Math.max(0, n)) : 50; save(); });
-    $('#yp_plus_log').prop('checked', s.log).on('change', function () { s.log = this.checked; save(); });
+    $('#yp_plus_time').prop('checked', s.timeEnabled).on('change', function () { s.timeEnabled = this.checked; save(); });
+    $('#yp_plus_round').val(s.roundMinutes).on('change', function () { const n = Number(this.value); s.roundMinutes = Number.isFinite(n) ? Math.min(60, Math.max(1, n)) : 6; save(); });    $('#yp_plus_log').prop('checked', s.log).on('change', function () { s.log = this.checked; save(); });
     $('#yp_plus_check').on('click', () => {
         const st = describeStatus();
         const preview = st.memory ? `\n\n记忆预览：\n${st.memory.slice(0, 300)}${st.memory.length > 300 ? ' ……' : ''}` : '';
