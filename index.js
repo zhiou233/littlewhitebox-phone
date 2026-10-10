@@ -51,7 +51,7 @@ export const DEFAULTS = Object.freeze({
     smartScroll: true,
     alwaysScrollOnSend: true,
     timeEnabled: true,       // 微信连发消息：放慢时间推进
-    roundMinutes: 6,         // 一轮回复（按 20 条算）的总时长，分钟
+    speedPercent: 100,       // 整体快慢：100 = 默认，50 = 快一倍，200 = 慢一倍
     log: false,
 });
 
@@ -129,31 +129,34 @@ export function isOwnMessageHtml(html) {
 }
 
 /* ================================================================== 功能三：微信连发消息的时间推进 */
-// 手机里「线上」微信聊天的时间由手机自己推进（忽略 AI 写的时间），原版每条消息要推进几分钟，
-// 一轮连发十几二十条就会跨十几分钟，中间出现好几个时间胶囊。
-// 这里改成：一轮回复的总时长固定在「设定分钟数」以内（默认 6 分钟，一轮 20 条左右刚好用满），
-// 每条消息按字数分到几十秒，总时长封顶。
-// 聊天界面「距离上一个时间胶囊满 3 分钟才出现新的」是手机自带规则，这里不动，
-// 所以一轮 6 分钟里通常出现 1~2 个时间胶囊。
+// 手机里「线上」微信聊天的时间由手机自己推进（忽略 AI 写的时间）。原版每条消息要推进几分钟，
+// 连发的短消息从第 3 条起还要额外加 1~3 分钟，一轮十几二十条就会跨十几分钟。
+// 这里改成「每条消息的间隔只由这条消息本身决定」，像真人发消息：
+//   固定的一点反应时间 + 字数 × 每字用时，再加一点随机；短句快、长句慢。
+// 没有「一轮总共几分钟」的限制，条数多、消息长，时间自然就久。
+// 「整体快慢」百分比把所有间隔统一放大或缩小。
+// 聊天界面「距离上一个时间胶囊满 3 分钟才出现新的」是手机自带规则，这里不动。
 
-const ASSUMED_MESSAGES_PER_ROUND = 15; // 按「一轮 20 条左右刚好用满总时长」来分配每条的时间（短句占的时间少，所以按 15 折算）
+export const REACT_SEC = 5;        // 每条消息固定的反应时间（秒）
+export const SEC_PER_CHAR = 1.4;   // 每个字额外用时（秒）
+export const MAX_ONE_MSG_SEC = 90; // 单条消息最多推进多久（防止一条超长消息把时间拉得离谱）
 
-// 一条消息要推进多少毫秒（不含「封顶」）
-export function stepMs(textLength, roundMinutes, rand = Math.random) {
-    const minutes = Math.max(0.5, Number(roundMinutes) || 6);
-    const perMsg = minutes * 60 * 1000 / ASSUMED_MESSAGES_PER_ROUND;
-    const weight = Math.min(1.5, Math.max(0.5, 0.5 + (Number(textLength) || 0) / 30)); // 短句快、长句慢
-    return perMsg * weight * (0.85 + rand() * 0.3);
+// 一条消息要推进多少毫秒
+export function stepMs(textLength, speedPercent, rand = Math.random) {
+    const len = Math.max(0, Number(textLength) || 0);
+    const pct = Number.isFinite(Number(speedPercent)) && Number(speedPercent) > 0 ? Number(speedPercent) : 100;
+    const sec = Math.min(MAX_ONE_MSG_SEC, REACT_SEC + len * SEC_PER_CHAR) * (0.75 + rand() * 0.5);
+    return Math.max(1000, Math.round(sec * 1000 * pct / 100));
 }
 
-// 这条消息实际推进多少毫秒：一轮开头的第一条只推几秒；封顶后每条只推 1 秒（保持先后顺序）
-export function advanceMs({ isFirst, elapsedMs, roundMinutes, textLength, rand = Math.random }) {
-    if (isFirst) return 5000 + Math.floor(rand() * 7000);
-    const roundMs = Math.max(0.5, Number(roundMinutes) || 6) * 60 * 1000;
-    const remain = roundMs - Math.max(0, Number(elapsedMs) || 0);
-    return Math.max(1000, Math.min(stepMs(textLength, roundMinutes, rand), remain));
+// 一轮开头的第一条只推几秒（不把 AI 请求的真实等待时间算进来）；其余按字数
+export function advanceMs({ isFirst, speedPercent, textLength, rand = Math.random }) {
+    if (isFirst) {
+        const pct = Number(speedPercent) > 0 ? Number(speedPercent) : 100;
+        return Math.max(1000, Math.round((4000 + Math.floor(rand() * 6000)) * pct / 100));
+    }
+    return stepMs(textLength, speedPercent, rand);
 }
-
 const CV_PATCHED = Symbol.for('yuzuki_phone_plus.chatview_patched2');
 
 function currentBaseTimestamp(view, tm) {
@@ -184,8 +187,8 @@ export function patchChatViewProto(proto) {
     proto._applyAiReplyTimeline = function (msg, fallback, options = {}) {
         const s = safeSettings();
         const tm = globalThis.VirtualPhone?.timeManager;
+        if (!s.timeEnabled || !msg || typeof msg !== 'object' || !tm) return origApply.call(this, msg, fallback, options);
         try {
-            if (!s.timeEnabled || !msg || typeof msg !== 'object' || !tm) return origApply.call(this, msg, fallback, options);
             // 「线上时间按现实时间」模式：手机本来就按真实时间走，不处理
             if (typeof this._shouldUseRealTimeForOnlineChat === 'function' && this._shouldUseRealTimeForOnlineChat(options)) {
                 return origApply.call(this, msg, fallback, options);
@@ -193,18 +196,15 @@ export function patchChatViewProto(proto) {
             const isRoundStart = options?.isFirstInReplyBatch === true || !(Number(this._aiReplyTimestampCursor) > 0);
             let base = currentBaseTimestamp(this, tm);
             if (!(base > 0)) return origApply.call(this, msg, fallback, options);
+            // 角色主动找你时，手机会给出「剧情里过了多久」，这个间隔保留
             if (isRoundStart) {
-                // 角色主动找你时，手机会给出「剧情里过了多久」，这个间隔保留
+                // 剧情时间只记到分钟：上一轮最后一条如果带着秒数，这一轮不要倒退回去
+                const last = Number(this._ypLastTs);
+                if (Number.isFinite(last) && last > base && last - base < 60000) base = last;
                 base += Math.max(0, Number(options?.extraGapMinutes) || 0) * 60 * 1000;
-                this._ypRoundStart = base;
-            } else if (!(Number(this._ypRoundStart) > 0)) {
-                this._ypRoundStart = base;
             }
             const text = String(msg.content || fallback || '').replace(/\s+/g, '');
-            const add = advanceMs({
-                isFirst: isRoundStart, elapsedMs: base - this._ypRoundStart,
-                roundMinutes: s.roundMinutes, textLength: text.length,
-            });
+            const add = advanceMs({ isFirst: isRoundStart, speedPercent: s.speedPercent, textLength: text.length });
             const ts = base + add;
             const prev = this._aiReplyTimeCursor || tm.getCurrentStoryTime?.() || {};
             msg.time = this._formatWechatTimeFromTimestamp(ts) || msg.time;
@@ -217,6 +217,7 @@ export function patchChatViewProto(proto) {
             }
             this._aiReplyTimeCursor = tm.getCurrentStoryTime?.() || { time: msg.time, date: msg.date, weekday: msg.weekday, timestamp: ts };
             this._aiReplyTimestampCursor = ts;
+            this._ypLastTs = ts;
             stats.timeline++;
         } catch (e) {
             console.error(LOG, '时间推进出错，改用手机原来的算法', e);
@@ -467,8 +468,9 @@ function mountSettings() {
         <label class="checkbox_label"><input type="checkbox" id="yp_plus_send"><span>我自己发消息时，总是滚到最底部</span></label>
         <h4 style="margin:12px 0 6px">微信连发消息的时间</h4>
         <label class="checkbox_label"><input type="checkbox" id="yp_plus_time"><span>放慢微信里 AI 连发消息的时间推进</span></label>
-        <div style="margin:6px 0 2px">一轮回复（20 条左右）的总时长上限，单位：分钟（默认 6）</div>
-        <input type="number" min="1" max="60" step="1" id="yp_plus_round" class="text_pole" style="width:120px">        <h4 style="margin:12px 0 6px">其他</h4>
+        <div style="margin:6px 0 2px">整体快慢（百分比）：100 = 默认；调小更快，调大更慢，例如 70 或 150</div>
+        <input type="number" min="10" max="500" step="5" id="yp_plus_speed" class="text_pole" style="width:120px">
+        <h4 style="margin:12px 0 6px">其他</h4>
         <label class="checkbox_label"><input type="checkbox" id="yp_plus_log"><span>在控制台输出调试日志</span></label>
         <div style="margin-top:8px"><input type="button" id="yp_plus_check" class="menu_button" value="检查状态"></div>
         <pre id="yp_plus_status" style="white-space:pre-wrap;margin:8px 0 0"></pre>
@@ -489,7 +491,7 @@ function mountSettings() {
     $('#yp_plus_smart').prop('checked', s.smartScroll).on('change', function () { s.smartScroll = this.checked; save(); });
     $('#yp_plus_send').prop('checked', s.alwaysScrollOnSend).on('change', function () { s.alwaysScrollOnSend = this.checked; save(); });
     $('#yp_plus_time').prop('checked', s.timeEnabled).on('change', function () { s.timeEnabled = this.checked; save(); });
-    $('#yp_plus_round').val(s.roundMinutes).on('change', function () { const n = Number(this.value); s.roundMinutes = Number.isFinite(n) ? Math.min(60, Math.max(1, n)) : 6; save(); });    $('#yp_plus_log').prop('checked', s.log).on('change', function () { s.log = this.checked; save(); });
+    $('#yp_plus_speed').val(s.speedPercent).on('change', function () { const n = Number(this.value); s.speedPercent = Number.isFinite(n) && n > 0 ? Math.min(500, Math.max(10, n)) : 100; save(); });
     $('#yp_plus_check').on('click', () => {
         const st = describeStatus();
         const preview = st.memory ? `\n\n记忆预览：\n${st.memory.slice(0, 300)}${st.memory.length > 300 ? ' ……' : ''}` : '';
