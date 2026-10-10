@@ -730,25 +730,91 @@ function scheduleSummaryCheck() {
     sumTimer = setTimeout(() => { checkSummaryTargets(); }, 8000); // 等手机把 AI 的回复都存好
 }
 
+// 把某个聊天里被压缩的消息恢复成普通消息，返回恢复了几条
+function restoreChatMessages(wd, chatId) {
+    let n = 0;
+    for (const m of wd.getMessages(chatId) || []) {
+        if (m?.ypPlusCompressed) {
+            delete m.ypPlusCompressed;
+            if (!isTimeMarkerMsg(m)) { delete m.hiddenFromPrompt; n++; } // 时间标记本来就是隐藏的，不能取消
+        }
+    }
+    if (n && wd._messagesDirty) wd._messagesDirty[chatId] = true;
+    return n;
+}
+
 // 撤销：把被压缩的消息恢复成普通消息，并删除所有摘要
 export async function undoAllSummaries() {
     const wd = getWD();
     let restored = 0;
     if (wd) {
-        for (const c of wd.getChatList?.() || []) {
-            let n = 0;
-            for (const m of wd.getMessages(c.id) || []) {
-                if (m?.ypPlusCompressed) {
-                    delete m.ypPlusCompressed;
-                    if (!isTimeMarkerMsg(m)) { delete m.hiddenFromPrompt; n++; } // 时间标记本来就是隐藏的，不能取消
-                }
-            }
-            if (n) { if (wd._messagesDirty) wd._messagesDirty[c.id] = true; restored += n; }
-        }
+        for (const c of wd.getChatList?.() || []) restored += restoreChatMessages(wd, c.id);
         await wd.saveData?.();
     }
     await writeSummaries({});
     return restored;
+}
+
+/* ---- 摘要管理：查看 / 修改 / 单独撤销某个微信窗口的摘要 ---- */
+
+export function isSummaryBusy(chatId) { return sumRunning.has(tavernKey() + '##' + String(chatId)); }
+
+// 当前酒馆聊天里所有微信窗口的摘要
+export function listSummaries() {
+    const wd = getWD();
+    const out = [];
+    for (const [id, rec] of Object.entries(readSummaries())) {
+        if (!rec?.text) continue;
+        let name = '', isGroup = false, count = 0, exists = false;
+        try {
+            const chat = wd?.getChat?.(id);
+            if (chat?.name) {
+                exists = true; name = chat.name; isGroup = chat.type === 'group';
+                count = (wd.getMessages(id) || []).filter(m => m?.ypPlusCompressed && !isTimeMarkerMsg(m)).length;
+            }
+        } catch { /* 忽略 */ }
+        out.push({
+            id, name: name || '（这个聊天已经不存在）', isGroup, text: String(rec.text), at: rec.at || 0,
+            rounds: rec.rounds || 1, edited: !!rec.edited, count, exists,
+            active: exists && count > 0, // 没有被压缩的消息时（聊天被清空过），这份摘要不会再被使用
+        });
+    }
+    return out;
+}
+
+const BUSY_MSG = '这个窗口正在生成摘要，请等它结束后再操作。';
+
+// 手动修改摘要文字。不改压缩次数，也不动任何聊天消息
+export async function saveSummaryText(chatId, text) {
+    chatId = String(chatId);
+    text = String(text ?? '').trim();
+    if (!text) return { ok: false, reason: '摘要不能是空的。想删掉请用「撤销这个窗口的摘要」。' };
+    if (text.length > 20000) return { ok: false, reason: '摘要太长了（超过 20000 字），请精简一下。' };
+    if (isSummaryBusy(chatId)) return { ok: false, reason: BUSY_MSG };
+    const all = readSummaries();
+    const rec = all[chatId];
+    if (!rec) return { ok: false, reason: '这份摘要已经不存在了，请刷新列表。' };
+    all[chatId] = { ...rec, text, edited: true, editedAt: Date.now() };
+    await writeSummaries(all);
+    if (readSummaries()[chatId]?.text !== text) return { ok: false, reason: '没能保存到当前聊天，请重试。' };
+    return { ok: true };
+}
+
+// 只撤销一个微信窗口：它被压缩的消息恢复成普通消息，并删掉它的摘要。别的窗口不动
+export async function undoSummary(chatId) {
+    chatId = String(chatId);
+    if (isSummaryBusy(chatId)) return { ok: false, reason: BUSY_MSG };
+    const wd = getWD();
+    let restored = 0;
+    // 先恢复消息并保存，再删摘要：中途出问题最坏只是摘要还在但已无效，不会丢聊天记录
+    if (wd && wd.getChat?.(chatId)) {
+        restored = restoreChatMessages(wd, chatId);
+        await wd.saveData?.();
+    }
+    const all = readSummaries();
+    delete all[chatId];
+    await writeSummaries(all);
+    return { ok: true, restored };
 }
 
 // 酒馆正文：手机在发送前把「微信历史」塞进了请求，这里在它后面补上摘要
@@ -1162,6 +1228,60 @@ function describeStatus() {
     return { text: lines.join('\n'), memory: mem.text };
 }
 
+export function renderSumPanel() {
+    const $ = globalThis.jQuery;
+    const box = $('#yp_plus_sum_panel');
+    box.empty();
+    if (!getWD()) { box.text('手机的微信数据还没加载（先打开一次微信 App，或发一条微信消息）。'); return; }
+    const tk = tavernKey();
+    const list = listSummaries();
+    if (!list.length) { box.text('当前这个酒馆聊天里还没有摘要。'); return; }
+    box.append($('<small>').text('这里是「当前打开的这个酒馆聊天」里，每个微信窗口的摘要（文字、语音、视频通话合在一份里）。改完点「保存修改」，下一次手机请求和酒馆正文就会用新的文字。'));
+    for (const it of list) {
+        const wrap = $('<div>').css({ margin: '8px 0', padding: '8px', border: '1px solid var(--SmartThemeBorderColor, #888)', borderRadius: '6px' });
+        wrap.append($('<div>').css('font-weight', 'bold').text(`${it.name}${it.isGroup ? '（群）' : ''}`));
+        const bits = [`已压缩 ${it.rounds} 次`];
+        if (it.at) bits.push(`最后更新 ${new Date(it.at).toLocaleString()}`);
+        if (it.exists) bits.push(`对应 ${it.count} 条已压缩的聊天`);
+        if (it.edited) bits.push('已手动修改过');
+        wrap.append($('<div>').append($('<small>').text(bits.join('；'))));
+        if (!it.active) {
+            wrap.append($('<div>').css('color', '#e0a030').append($('<small>').text(
+                it.exists ? '⚠ 这个窗口里已经没有被压缩的消息（聊天可能被清空过），这份摘要现在不会被使用。' : '⚠ 这个微信聊天已经不存在了，这份摘要不会被使用，可以直接删除。')));
+        }
+        const ta = $('<textarea class="text_pole" rows="9">').css({ width: '100%', marginTop: '6px' }).val(it.text);
+        const counter = $('<small>');
+        const refreshCounter = () => counter.text(`${ta.val().length} 字`);
+        refreshCounter();
+        ta.on('input', refreshCounter);
+        const status = $('<div>').css('margin-top', '4px').append($('<small>'));
+        const say = (msg) => status.find('small').text(msg);
+        const stale = () => {
+            if (tavernKey() === tk) return false;
+            say('你已经切换了聊天，这个列表已过期，请重新点「管理摘要」。');
+            return true;
+        };
+        const save = $('<input type="button" class="menu_button" value="保存修改">').on('click', async () => {
+            if (stale()) return;
+            const r = await saveSummaryText(it.id, ta.val());
+            say(r.ok ? `已保存（${ta.val().trim().length} 字）。` : `没保存：${r.reason}`);
+        });
+        const undo = $('<input type="button" class="menu_button" value="撤销这个窗口的摘要（恢复原文）">').on('click', async () => {
+            if (stale()) return;
+            const tip = it.exists
+                ? `确定只撤销「${it.name}」的摘要？\n这个窗口被压缩的 ${it.count} 条消息会恢复成普通消息（重新发给 AI），这份摘要会被删除。别的窗口不受影响。\n如果恢复后原文又够触发条数，稍后会自动重新压缩。`
+                : `确定删除这份摘要？`;
+            if (!globalThis.confirm(tip)) return;
+            const r = await undoSummary(it.id);
+            if (!r.ok) { say(`没撤销：${r.reason}`); return; }
+            renderSumPanel();
+            $('#yp_plus_sum_panel').prepend($('<div>').append($('<small>').text(`已撤销「${it.name}」的摘要，恢复了 ${r.restored} 条消息。`)));
+        });
+        wrap.append(ta, $('<div>').append(counter), $('<div>').css({ display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '4px' }).append(save, undo), status);
+        box.append(wrap);
+    }
+}
+
 function mountSettings() {
     const $ = globalThis.jQuery;
     if (!$ || $('#yp_plus_settings').length) return;
@@ -1203,6 +1323,8 @@ function mountSettings() {
           <input type="button" id="yp_plus_sum_now" class="menu_button" value="现在检查并压缩">
           <input type="button" id="yp_plus_sum_undo" class="menu_button" value="撤销全部摘要（恢复原文）">
         </div>
+        <div style="margin-top:6px"><input type="button" id="yp_plus_sum_manage" class="menu_button" value="管理摘要（查看 / 修改 / 单独撤销）"></div>
+        <div id="yp_plus_sum_panel" style="margin-top:6px"></div>
         <small>摘要会作为「手机微信聊天记录」最前面的一段，同时带进手机的 AI 请求和酒馆正文。被压缩的老消息在手机里照常能看到，只是不再发给 AI。</small>
         <h4 style="margin:12px 0 6px">手机读取的正文楼层</h4>
         <label class="checkbox_label"><input type="checkbox" id="yp_plus_ctx"><span>手机读取的正文楼层数，跟随小白X的总结进度</span></label>
@@ -1269,6 +1391,7 @@ function mountSettings() {
         const n = await undoAllSummaries();
         $('#yp_plus_status').text(`已恢复 ${n} 条消息，并删除了全部摘要。`);
     });
+    $('#yp_plus_sum_manage').on('click', () => renderSumPanel());
     $('#yp_plus_check').on('click', () => {
         $('#yp_plus_status').text(describeStatus().text);
     });
