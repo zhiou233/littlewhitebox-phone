@@ -61,6 +61,8 @@ export const DEFAULTS = Object.freeze({
     sumTrigger: 300,         // 可见聊天攒到多少条就触发压缩
     sumTake: 200,            // 每次压缩最老的多少条（剩下的原文保留）
     sumMaxChars: 1500,       // 摘要大致上限（字）
+    contextFollow: true,     // 手机读取的正文楼层数：跟随小白X的总结进度
+    reasoningEffort: 'min',  // 手机请求的推理强度：off / min / low / medium / high / max
     log: false,
 });
 
@@ -620,18 +622,28 @@ function offlineLimit(chat) {
 }
 function toast(kind, msg) { try { globalThis.toastr?.[kind]?.(msg, '微信聊天摘要'); } catch { /* 忽略 */ } }
 
+// 当前是哪一个酒馆聊天（角色卡 / 群 / 聊天文件）。摘要请求要等 AI 返回，期间如果你切了聊天，结果必须作废
+function tavernKey() {
+    try {
+        const c = ctx();
+        return [c.groupId ?? '', c.characterId ?? '', c.chatId ?? ''].join('|');
+    } catch { return ''; }
+}
+
 const sumRunning = new Set();
 const sumFailedAt = new Map();
 
 // -> { status: 'done' | 'skip' | 'fail', reason? }
 export async function compressChat(chatId, { force = false, manual = false } = {}) {
     chatId = String(chatId);
+    const tk = tavernKey();
+    const runKey = tk + '##' + chatId;
     const s = getSettings();
     const wd = getWD();
     const holder = getCallAiHolder();
     if (!wd || !holder) return { status: 'skip', reason: '手机还没加载好' };
-    if (sumRunning.has(chatId)) return { status: 'skip', reason: '正在压缩中' };
-    if (!force && !manual && Date.now() - (sumFailedAt.get(chatId) || 0) < SUM_RETRY_MS) return { status: 'skip', reason: '刚失败过，稍后重试' };
+    if (sumRunning.has(runKey)) return { status: 'skip', reason: '正在压缩中' };
+    if (!force && !manual && Date.now() - (sumFailedAt.get(runKey) || 0) < SUM_RETRY_MS) return { status: 'skip', reason: '刚失败过，稍后重试' };
     const chat = wd.getChat?.(chatId);
     if (!chat) return { status: 'skip', reason: '找不到这个聊天' };
     const msgs = wd.getMessages(chatId) || [];
@@ -651,31 +663,38 @@ export async function compressChat(chatId, { force = false, manual = false } = {
         chatName: chat.name, isGroup: chat.type === 'group', userName, maxChars: p.maxChars,
     });
 
-    sumRunning.add(chatId);
+    sumRunning.add(runKey);
     try {
         const res = await holder.callAI(req, { appId: 'wechat', ypPlusInternal: true, temperature: 0.3 });
         const text = cleanSummary(res?.summary ?? res?.content ?? res?.text, p.maxChars);
         if (!res || res.success === false || !text) throw new Error(res?.error || 'AI 返回为空');
+        // 等 AI 的这段时间里如果切换了聊天 / 角色卡，这份摘要属于旧聊天，丢弃，什么都不写
+        if (tavernKey() !== tk || getWD() !== wd) {
+            console.info(LOG, '摘要生成期间切换了聊天，已丢弃这次结果，之后会重新压缩');
+            return { status: 'skip', reason: '压缩期间切换了聊天，结果已丢弃' };
+        }
         // 先存摘要，再隐藏原消息：中途出问题时，最坏只是摘要和原文同时存在，不会丢记录
         const all = readSummaries();
         all[chatId] = { text, at: Date.now(), rounds: (old?.rounds || 0) + 1 };
         await writeSummaries(all);
+        // 读回来确认真的存进去了（没有打开的聊天时存储会静默失败），确认之前不隐藏任何原消息
+        if (readSummaries()[chatId]?.text !== text) throw new Error('摘要没能保存到当前聊天');
         for (const m of target) { m.hiddenFromPrompt = true; m.ypPlusCompressed = true; }
         for (const m of msgs.slice(0, plan.cut)) if (isTimeMarkerMsg(m)) m.ypPlusCompressed = true; // 时间标记本来就不发给 AI，只做标记，方便正文去重时对数
         if (wd._messagesDirty) wd._messagesDirty[chatId] = true;
         await wd.saveData?.();
         stats.summarized++;
-        sumFailedAt.delete(chatId);
+        sumFailedAt.delete(runKey);
         toast('success', `「${chat.name}」的 ${plan.count} 条旧聊天已压缩成摘要`);
         return { status: 'done', count: plan.count, chars: text.length };
     } catch (e) {
-        sumFailedAt.set(chatId, Date.now());
+        sumFailedAt.set(runKey, Date.now());
         stats.sumFailed++;
         console.warn(LOG, '摘要失败', e);
         toast('warning', `「${chat.name}」的摘要生成失败（${e?.message || e}）。聊天记录没有被改动，稍后会自动重试。`);
         return { status: 'fail', reason: String(e?.message || e) };
     } finally {
-        sumRunning.delete(chatId);
+        sumRunning.delete(runKey);
     }
 }
 
@@ -870,10 +889,10 @@ function tryPatchApi() {
     if (holder.callAI[PATCHED]) return true;
     const original = holder.callAI;
     const wrapped = function (messages, options) {
-        if (options?.ypPlusInternal) return original.call(this, messages, options); // 摘要自己的请求：不加记忆/缓存点
+        if (options?.ypPlusInternal) return trackPhoneCall(() => original.call(this, messages, options)); // 摘要自己的请求：不加记忆/缓存点
         let next = messages;
         try { next = prepareMessages(messages, options || {}); } catch (e) { console.error(LOG, e); }
-        const result = original.call(this, next, options);
+        const result = trackPhoneCall(() => original.call(this, next, options));
         try {
             const id = String(options?.appId || 'phone_online');
             if (id === 'wechat' || id === 'phone_online') Promise.resolve(result).then(scheduleSummaryCheck, scheduleSummaryCheck);
@@ -890,6 +909,142 @@ function startApiPatching() {
     if (tryPatchApi()) return;
     // 手机是懒加载的，等它的 ApiManager 出现
     const timer = setInterval(() => { if (tryPatchApi()) clearInterval(timer); }, 1500);
+}
+
+/* ================================================================== 功能五：手机请求的推理强度 */
+// 手机发给酒馆后端的请求里没有 reasoning_effort，Claude 5 / Opus 4.7+ 这类自适应思考的模型会按模型自己的默认值思考。
+// 这里在手机请求（且仅手机请求）发出去之前，补上 reasoning_effort。酒馆后端会把它转成 output_config.effort。
+// 只对「自适应思考」的新模型生效；老模型（如 opus-4-5）不带这个参数时本来就不思考，加了反而会开启思考，所以跳过。
+const EFFORT_LABELS = { off: '不设置（保持手机原样）', min: '极低', low: '低', medium: '中', high: '高', max: '最高' };
+const ADAPTIVE_MODEL = /claude-(opus-4-7|opus-4-8|opus-5|sonnet-5|fable)/;
+let phoneInflight = 0;
+const effortState = { last: '' };
+
+function trackPhoneCall(fn) {
+    phoneInflight++;
+    let result;
+    try { result = fn(); } catch (e) { phoneInflight--; throw e; }
+    const done = () => { phoneInflight = Math.max(0, phoneInflight - 1); };
+    Promise.resolve(result).then(done, done);
+    return result;
+}
+
+// -> { body: 新的请求体字符串 | null, note }
+export function addReasoningEffort(bodyText, effort) {
+    if (!effort || effort === 'off' || !Object.hasOwn(EFFORT_LABELS, effort)) return { body: null, note: '' };
+    let b;
+    try { b = JSON.parse(bodyText); } catch { return { body: null, note: '' }; }
+    if (!b || typeof b !== 'object') return { body: null, note: '' };
+    // 手机请求的特征：走酒馆后端的 claude 通道，并带 mode / instruction_mode = chat（酒馆自己的正文请求没有这两个字段）
+    if (b.chat_completion_source !== 'claude' || b.instruction_mode !== 'chat') return { body: null, note: '' };
+    if (Object.hasOwn(b, 'reasoning_effort')) return { body: null, note: '请求里已经有推理强度，没改' };
+    if (!ADAPTIVE_MODEL.test(String(b.model || ''))) return { body: null, note: `模型 ${b.model || '未知'} 不是自适应思考的新模型，没加（它不带这个参数时本来就不思考）` };
+    b.reasoning_effort = effort;
+    return { body: JSON.stringify(b), note: `已加上（${EFFORT_LABELS[effort]}）` };
+}
+
+function tryPatchFetch() {
+    const f = globalThis.fetch;
+    if (typeof f !== 'function') return false;
+    if (f[PATCHED]) return true;
+    const wrapped = function (input, init) {
+        try {
+            if (phoneInflight > 0 && init && typeof init.body === 'string') {
+                const url = typeof input === 'string' ? input : (input?.url || '');
+                if (url.includes('/api/backends/chat-completions/generate')) {
+                    const r = addReasoningEffort(init.body, safeSettings().reasoningEffort);
+                    if (r.note) effortState.last = r.note;
+                    if (r.body) init = { ...init, body: r.body };
+                }
+            }
+        } catch (e) { console.error(LOG, e); }
+        return f.call(this, input, init);
+    };
+    wrapped[PATCHED] = true;
+    globalThis.fetch = wrapped;
+    console.info(LOG, '已挂接手机请求的推理强度');
+    return true;
+}
+
+function s_effortLines() {
+    let s; try { s = getSettings(); } catch { return []; }
+    const e = s.reasoningEffort;
+    if (!e || e === 'off') return ['手机推理强度：不设置'];
+    return [`手机推理强度：${EFFORT_LABELS[e] || e}` + (effortState.last ? `；最近一次手机请求：${effortState.last}` : '；还没有手机请求')];
+}
+
+/* ================================================================== 功能四：手机读取正文楼层 跟随小白X的总结进度 */
+// 小手机里的「正文楼层数」(phone-context-limit) 原本永远取聊天最后 N 层。
+// 小白X总结到第 70 楼、正文剩 30 楼时，N=20 就会漏掉中间的 10 楼。
+// 这里让手机读取时的实际层数 = max(你设的 N, 小白X还没总结（还在正文里）的楼层数)。
+const CTX_LIMIT_KEY = 'phone-context-limit';
+const LWB_EXT_ID = 'LittleWhiteBox';
+const CTX_FOLLOW_CAP = 200; // 防止小白X长期不总结时越读越多
+
+// chat：酒馆聊天数组；boundary：小白X已总结到的楼层号（-1/空 = 没有总结）
+export function followLimit(base, chat, boundary) {
+    const b = parseInt(base, 10);
+    if (!Number.isFinite(b) || b <= 0) return base; // 0 = 用户关了正文上下文，不动
+    if (!Array.isArray(chat) || !chat.length) return b;
+    if (!Number.isInteger(boundary) || boundary < 0) return b; // 小白X还没总结过
+    // 小白X「隐藏已总结」：从第 1 楼开始连续隐藏到的位置，就是酒馆正文真正看不到的部分
+    let h = -1;
+    while (h + 1 < chat.length && chat[h + 1]?.is_system === true) h++;
+    const hiddenThrough = (h >= 0 && h <= boundary) ? h : boundary;
+    const extra = chat.length - 1 - hiddenThrough;
+    return Math.max(b, Math.min(CTX_FOLLOW_CAP, extra));
+}
+
+function lwbBoundary() {
+    try {
+        const v = ctx().chatMetadata?.extensions?.[LWB_EXT_ID]?.storySummary?.lastSummarizedMesId;
+        return Number.isInteger(v) ? v : -1;
+    } catch { return -1; }
+}
+
+function tryPatchContextLimit() {
+    const st = globalThis.VirtualPhone?.storage;
+    if (!st || typeof st.get !== 'function') return false;
+    if (st.get[PATCHED]) return true;
+    const orig = st.get;
+    const wrapped = function (key) {
+        const v = orig.apply(this, arguments);
+        if (key !== CTX_LIMIT_KEY) return v;
+        try {
+            if (!safeSettings().contextFollow) return v;
+            // 手机的设置页要显示你自己填的数字，不能显示被调整后的
+            if (/settings-app/.test(new Error().stack || '')) return v;
+            const c = ctx();
+            return followLimit(v, c.chat, lwbBoundary());
+        } catch { return v; }
+    };
+    wrapped[PATCHED] = true;
+    wrapped.orig = orig;
+    st.get = wrapped;
+    console.info(LOG, '已挂接手机的「正文楼层数」读取');
+    return true;
+}
+
+function startContextPatching() {
+    tryPatchContextLimit();
+    tryPatchFetch();
+    if (globalThis.__yuzukiPhonePlusCtxTimer) return;
+    // 手机重新加载后 storage 可能换成新对象，所以一直检查（很轻）
+    globalThis.__yuzukiPhonePlusCtxTimer = setInterval(() => { tryPatchContextLimit(); tryPatchFetch(); }, 3000);
+}
+
+function s_contextLine() {
+    let s; try { s = getSettings(); } catch { return []; }
+    if (!s.contextFollow) return ['手机正文楼层联动：已关闭'];
+    const st = globalThis.VirtualPhone?.storage;
+    const get = st?.get?.orig || st?.get;
+    if (!get) return ['手机正文楼层联动：手机还没加载'];
+    let base; try { base = get.call(st, CTX_LIMIT_KEY); } catch { base = undefined; }
+    const c = ctx();
+    const b = lwbBoundary();
+    const eff = followLimit(base ?? 20, c.chat, b);
+    if (b < 0) return [`手机正文楼层联动：已开启（小白X还没有总结，手机读最近 ${base ?? 20} 层）`];
+    return [`手机正文楼层联动：已开启（小白X已总结到第 ${b + 1} 楼，聊天共 ${c.chat?.length || 0} 楼；手机设置读 ${base ?? 20} 层，现在实际读 ${eff} 层）`];
 }
 
 /* ---- 通话智能滚动：接管每个通话消息容器的 scrollTop 赋值 ---- */
@@ -958,7 +1113,7 @@ function startScrollObserver() {
 
 function s_cacheLine() {
     let on = false; try { on = !!getSettings().cacheEnabled; } catch { /* 忽略 */ }
-    return on ? `手机缓存点：已开启（已给 ${stats.cached} 次手机请求打了缓存点）` : '手机缓存点：已关闭';
+    return on ? '手机缓存点：已开启' : '手机缓存点：已关闭';
 }
 
 function s_sumLines() {
@@ -982,7 +1137,6 @@ function s_sumLines() {
         rows.push(`  · ${c.name}${c.type === 'group' ? '（群）' : ''}：当前原文 ${lines} 条` + (rec ? `；摘要 ${rec.text.length} 字（已压缩 ${rec.rounds || 1} 次）` : '；还没有摘要') + warn);
     }
     out.push(...(rows.length ? rows : ['  （目前没有已加载的聊天）']));
-    out.push(`  已压缩 ${stats.summarized} 次，失败 ${stats.sumFailed} 次；摘要已带进手机请求 ${stats.sumInjectedPhone} 次、酒馆正文 ${stats.sumInjectedMain} 次`);
     if (stats.sumTrimFail) out.push(`  ⚠ 正文去重有 ${stats.sumTrimFail} 次没对上（已压缩的旧消息和摘要同时出现，不会丢信息，只是重复）。`);
     return out;
 }
@@ -991,18 +1145,19 @@ function describeStatus() {
     const holder = getCallAiHolder();
     const hooked = !!holder?.callAI?.[PATCHED];
     const mem = getMemory();
-    const live = document.querySelectorAll(CONTAINER_SELECTOR).length;
     const lines = [];
     lines.push(hooked ? '手机挂接：正常' : '手机挂接：未就绪（柚月小手机是否已安装并加载？）');
     if (mem.source === 'live') lines.push(`小白X记忆：${mem.text.length} 字（实时读取）`);
     else if (mem.source === 'cache') lines.push(`小白X记忆：${mem.text.length} 字（使用 ${new Date(mem.at).toLocaleString()} 保存的副本）`);
     else lines.push('小白X记忆：暂无。请先用开启了小白X记忆的聊天生成一次正文回复。');
-    lines.push(`已向手机请求注入记忆：${stats.injected} 次`);
+
     lines.push(s_cacheLine());
     lines.push(...s_sumLines());
-    lines.push(`通话界面：已接管 ${stats.containers} 个（当前打开 ${live} 个），已拦截强制滚动 ${stats.blockedScrolls} 次`);
+    lines.push(...s_contextLine());
+    lines.push(...s_effortLines());
+
     lines.push(Object.getPrototypeOf(globalThis.VirtualPhone?.wechatApp?.chatView || {})?.[Symbol.for('yuzuki_phone_plus.chatview_patched2')]
-        ? `微信时间推进：已生效（已处理 ${stats.timeline} 条消息）`
+        ? '微信时间推进：已生效'
         : '微信时间推进：还没生效（先打开一次微信 App；打开后仍这样，说明手机内部改了名字，需要适配）');
     return { text: lines.join('\n'), memory: mem.text };
 }
@@ -1016,7 +1171,7 @@ function mountSettings() {
     const html = `
     <div id="yp_plus_settings" class="inline-drawer">
       <div class="inline-drawer-toggle inline-drawer-header">
-        <b>柚月小手机增强（小白X记忆 + 缓存点 + 微信聊天摘要 + 智能滚动 + 微信时间）</b>
+        <b>柚月小手机增强（小白X记忆 + 缓存点 + 微信聊天摘要 + 正文楼层联动 + 推理强度 + 智能滚动 + 微信时间）</b>
         <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
       </div>
       <div class="inline-drawer-content">
@@ -1049,6 +1204,19 @@ function mountSettings() {
           <input type="button" id="yp_plus_sum_undo" class="menu_button" value="撤销全部摘要（恢复原文）">
         </div>
         <small>摘要会作为「手机微信聊天记录」最前面的一段，同时带进手机的 AI 请求和酒馆正文。被压缩的老消息在手机里照常能看到，只是不再发给 AI。</small>
+        <h4 style="margin:12px 0 6px">手机读取的正文楼层</h4>
+        <label class="checkbox_label"><input type="checkbox" id="yp_plus_ctx"><span>手机读取的正文楼层数，跟随小白X的总结进度</span></label>
+        <small>小白X总结到哪，手机就从那里往后把还没总结的楼层全部读进来，不会漏掉中间的楼层。小手机里设置的「正文楼层数」是最少读几层，不会比它少。</small>
+        <h4 style="margin:12px 0 6px">手机请求的推理强度</h4>
+        <select id="yp_plus_effort" class="text_pole" style="width:240px">
+          <option value="off">不设置（保持手机原样）</option>
+          <option value="min">极低</option>
+          <option value="low">低</option>
+          <option value="medium">中</option>
+          <option value="high">高</option>
+          <option value="max">最高</option>
+        </select>
+        <small>手机本来不发这个参数。这里选了之后，手机的每次 AI 请求（微信、通话、摘要等）都会带上它，数值越低回复越快。只对 Claude 5 / Opus 4.7 以上这类新模型生效，老模型会自动跳过。酒馆主聊天的推理强度不受影响。</small>
         <h4 style="margin:12px 0 6px">通话智能滚动</h4>
         <label class="checkbox_label"><input type="checkbox" id="yp_plus_smart"><span>我往上翻看通话消息时，不要再自动拉到最底部</span></label>
         <label class="checkbox_label"><input type="checkbox" id="yp_plus_send"><span>我自己发消息时，总是滚到最底部</span></label>
@@ -1076,6 +1244,8 @@ function mountSettings() {
     $('#yp_plus_clear').on('click', () => { clearCache(); $('#yp_plus_status').text('已清除保存的记忆副本。'); });
     $('#yp_plus_cache').prop('checked', s.cacheEnabled).on('change', function () { s.cacheEnabled = this.checked; save(); });
     $('#yp_plus_ttl').val(s.cacheTtl).on('change', function () { s.cacheTtl = this.value === '1h' ? '1h' : '5m'; save(); });
+    $('#yp_plus_ctx').prop('checked', s.contextFollow).on('change', function () { s.contextFollow = this.checked; save(); });
+    $('#yp_plus_effort').val(s.reasoningEffort).on('change', function () { s.reasoningEffort = this.value; save(); });
     $('#yp_plus_smart').prop('checked', s.smartScroll).on('change', function () { s.smartScroll = this.checked; save(); });
     $('#yp_plus_send').prop('checked', s.alwaysScrollOnSend).on('change', function () { s.alwaysScrollOnSend = this.checked; save(); });
     $('#yp_plus_time').prop('checked', s.timeEnabled).on('change', function () { s.timeEnabled = this.checked; save(); });
@@ -1100,9 +1270,7 @@ function mountSettings() {
         $('#yp_plus_status').text(`已恢复 ${n} 条消息，并删除了全部摘要。`);
     });
     $('#yp_plus_check').on('click', () => {
-        const st = describeStatus();
-        const preview = st.memory ? `\n\n记忆预览：\n${st.memory.slice(0, 300)}${st.memory.length > 300 ? ' ……' : ''}` : '';
-        $('#yp_plus_status').text(st.text + preview);
+        $('#yp_plus_status').text(describeStatus().text);
     });
 }
 
@@ -1115,7 +1283,7 @@ function snapshotAfterGeneration() {
         const c = ctx();
         const { eventSource, event_types: ev } = c;
         if (eventSource && ev) {
-            if (ev.APP_READY) eventSource.on(ev.APP_READY, () => { mountSettings(); startApiPatching(); startScrollObserver(); startChatViewPatching(); });
+            if (ev.APP_READY) eventSource.on(ev.APP_READY, () => { mountSettings(); startApiPatching(); startScrollObserver(); startChatViewPatching(); startContextPatching(); });
             if (ev.CHAT_COMPLETION_PROMPT_READY) eventSource.on(ev.CHAT_COMPLETION_PROMPT_READY, onPromptReady); // 在手机注入之后补上摘要
             for (const name of ['MESSAGE_RECEIVED', 'GENERATION_ENDED']) if (ev[name]) eventSource.on(ev[name], scheduleSummaryCheck);
             // 每次正文生成后刷新记忆副本
@@ -1127,6 +1295,7 @@ function snapshotAfterGeneration() {
         startApiPatching();
         startScrollObserver();
         startChatViewPatching();
+        startContextPatching();
     } catch (e) {
         console.error(LOG, '初始化失败', e);
     }
