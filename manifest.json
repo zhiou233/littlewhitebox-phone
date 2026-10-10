@@ -1,0 +1,11 @@
+{
+    "display_name": "柚月小手机增强（小白X记忆 + 智能滚动）",
+    "loading_order": 300,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "author": "community",
+    "version": "1.0.0",
+    "homePage": "",
+    "auto_update": false
+}
